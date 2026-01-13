@@ -1,0 +1,90 @@
+# ============================================================================
+# CONFIG.yml - ENHANCED WITH TIER 1-3 VISUALIZATION SETTINGS
+# ============================================================================
+
+paths:
+  base_output_dir: "E:\\Processing\\ICeSat-2\\output_data"
+
+columns:
+  latitude: "lat_avg"
+  longitude: "lon_avg"
+  subsidence_rate: "subsidence_rate_m_per_year"
+
+visualization:
+  # OUTPUT RESOLUTION
+  dpi_screen: 300
+  dpi_publication: 600
+  
+  # TYPOGRAPHY (TIER 1)
+  font_family: "sans-serif"
+  font_title_size: 16
+  font_label_size: 13
+  font_tick_size: 11
+  font_caption_size: 9
+  font_weight_title: "bold"
+  font_weight_label: "bold"
+  
+  # COLORMAPS (TIER 1)
+  colormap_main: "viridis"
+  colormap_diverging: "RdYlBu_r"
+  colormap_heatmap: "YlOrRd"
+  
+  # COLORS FOR ANNOTATIONS (TIER 2)
+  color_significance: "#d62728"
+  color_positive: "#2ca02c"
+  color_uncertainty: "#ff7f0e"
+  color_hotspot: "#d73027"
+  color_coldspot: "#4575b4"
+  
+  # CARTOGRAPHIC ELEMENTS (TIER 1-2)
+  add_scale_bars: true
+  add_north_arrows: true
+  scale_bar_length_km: 2.0
+  add_grid_overlay: true
+  grid_alpha: 0.3
+  grid_linestyle: "--"
+  grid_linewidth: 0.5
+  
+  # UNCERTAINTY VISUALIZATION (TIER 1-2)
+  show_error_bars: true
+  show_ci_shading: true
+  show_uncertainty_halos: true
+  confidence_level: 0.95
+  bootstrap_iterations: 1000
+  
+  # PANEL LABELING (TIER 2)
+  panel_labels: ["a", "b", "c", "d"]
+  panel_label_fontsize: 14
+  panel_label_weight: "bold"
+  
+  # INTERACTIVE FIGURES (TIER 3)
+  generate_html_figures: true
+  html_zoom_level: 6
+  
+  # CARTOPY BASEMAP (TIER 3 - Optional)
+  use_cartopy: false
+  basemap_style: "Natural Earth"
+  basemap_resolution: "50m"
+
+filtering:
+  min_neighbor_count: 100
+  outlier_sigma: 3
+  min_time_separation_days: 10
+  max_time_separation_days: 2000
+
+temporal:
+  filter_option: "2"
+  summer_months: [6, 7, 8, 9]
+
+statistics:
+  confidence_level: 0.95
+  bootstrap_iterations: 1000
+  bootstrap_seed: 42
+  vmin_percentile: 5
+  vmax_percentile: 95
+
+report:
+  generate_markdown: true
+  include_figure_captions: true
+  include_data_tables: true
+  include_metadata: true
