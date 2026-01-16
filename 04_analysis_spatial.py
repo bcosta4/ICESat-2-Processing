@@ -41,7 +41,6 @@ Document these parameters clearly and keep them fixed for all runs
 that you want to compare.
 
 Complete audit trail provided via metadata JSON and execution log.
-
 ================================================================================
 """
 
@@ -65,7 +64,6 @@ if sys.stderr.encoding != 'utf-8':
 # ============================================================================
 # GIT HASH TRACKING
 # ============================================================================
-
 def get_git_hash():
     """Get git commit hash for reproducibility"""
     try:
@@ -83,7 +81,6 @@ def get_git_hash():
 # ============================================================================
 # LOGGING SETUP (DUAL OUTPUT: FILE + CONSOLE)
 # ============================================================================
-
 def setup_logging(output_dir):
     """Configure logging to both file and console"""
     
@@ -117,7 +114,6 @@ def setup_logging(output_dir):
 # ============================================================================
 # RUN METADATA CLASS (AUDIT TRAIL)
 # ============================================================================
-
 class RunMetadata:
     """Capture complete run parameters for reproducibility"""
     
@@ -167,7 +163,6 @@ class RunMetadata:
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-
 BASE_OUTPUT_DIR = Path(r'E:\Processing\ICeSat-2\output_data')
 
 # Load latest run timestamp
@@ -188,7 +183,6 @@ SUMMARY_FILE = OUTPUT_DIR / '04_analysis_summary.txt'
 # ============================================================================
 # SPATIAL PARAMETERS (TUNED FOR YOUR STUDY)
 # ============================================================================
-
 # Hybrid k-nearest + radius filter approach
 SEARCH_RADIUS_M = 2000.0  # 2 km radius (optimal for coastal features)
 K_NEIGHBORS_PRIMARY = 250  # Query this many neighbors (memory fixed)
@@ -201,7 +195,6 @@ GRID_CELL_SIZE_M = 500.0  # 500m grid cells
 # ============================================================================
 # PRINT HEADER & SETUP LOGGING
 # ============================================================================
-
 print("="*80, flush=True)
 print("SCRIPT 04: SPATIAL ANALYSIS - HYBRID k-NEAREST + RADIUS FILTER", flush=True)
 print("="*80, flush=True)
@@ -242,7 +235,6 @@ metadata.configuration = {
 # ============================================================================
 # LOAD DATA
 # ============================================================================
-
 logger.info("\nLOADING DATA")
 print("\n" + "="*80, flush=True)
 print("LOADING DATA", flush=True)
@@ -296,7 +288,6 @@ print(f"✓ Valid coordinates: {len(df):,} / {len(valid_mask):,}", flush=True)
 # ============================================================================
 # BUILD SPATIAL INDEX
 # ============================================================================
-
 logger.info("\nBUILDING SPATIAL INDEX")
 print("\n" + "="*80, flush=True)
 print("BUILDING SPATIAL INDEX", flush=True)
@@ -315,7 +306,6 @@ print(f"✓ KDTree built", flush=True)
 # ============================================================================
 # HYBRID k-NEAREST + RADIUS FILTERING
 # ============================================================================
-
 logger.info("\nHYBRID SPATIAL ANALYSIS: k-NEAREST + RADIUS FILTER")
 print("\n" + "="*80, flush=True)
 print("HYBRID SPATIAL ANALYSIS: k-NEAREST + RADIUS FILTER", flush=True)
@@ -387,7 +377,6 @@ neighbor_counts = np.array(neighbor_counts)
 # ============================================================================
 # VERIFY SUFFICIENT k
 # ============================================================================
-
 logger.info("\nNeighbor statistics:")
 print(f"\nNeighbor statistics:", flush=True)
 
@@ -418,7 +407,6 @@ else:
 # ============================================================================
 # COMPUTE LOCAL SUBSIDENCE STATISTICS
 # ============================================================================
-
 logger.info("\nCOMPUTING LOCAL SUBSIDENCE STATISTICS")
 print("\n" + "="*80, flush=True)
 print("COMPUTING LOCAL SUBSIDENCE STATISTICS", flush=True)
@@ -475,7 +463,6 @@ print(f"✓ Local statistics computed for {len(df_stats):,} points", flush=True)
 # ============================================================================
 # GRID-BASED STATISTICS
 # ============================================================================
-
 logger.info(f"\nComputing grid-based statistics ({GRID_CELL_SIZE_M:.0f}m cells)...")
 print(f"\nComputing grid-based statistics ({GRID_CELL_SIZE_M:.0f}m cells)...", flush=True)
 
@@ -513,7 +500,6 @@ print(f"✓ Computed statistics for {len(grid_stats):,} grid cells", flush=True)
 # ============================================================================
 # SAVE RESULTS
 # ============================================================================
-
 logger.info("\nSAVING RESULTS")
 print("\n" + "="*80, flush=True)
 print("SAVING RESULTS", flush=True)
@@ -540,7 +526,6 @@ print(f"✓ Saved ({size_mb:.1f} MB)", flush=True)
 # ============================================================================
 # SAVE SUMMARY
 # ============================================================================
-
 logger.info(f"Saving summary: {SUMMARY_FILE.name}")
 print(f"\nSaving summary: {SUMMARY_FILE.name}", flush=True)
 
@@ -587,7 +572,6 @@ print(f"✓ Summary saved", flush=True)
 # ============================================================================
 # FINALIZE METADATA AND SAVE
 # ============================================================================
-
 metadata.processing_results = {
     'total_points': len(df_stats),
     'k_value_used': int(k_value),
@@ -602,9 +586,127 @@ metadata_file = metadata.save(OUTPUT_DIR)
 logger.info(f"Metadata saved: {metadata_file.name}")
 
 # ============================================================================
+# FIGURE GENERATION FUNCTIONS
+# ============================================================================
+def create_spatial_contour_map_fig04(spatial_grid, output_dir):
+    """Generate contour map of subsidence rates"""
+    import matplotlib.pyplot as plt
+    
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+    
+    # Left: Spatial contours
+    if 'rate_mm_yr' in spatial_grid.columns:
+        pivot = spatial_grid.pivot_table(
+            values='rate_mm_yr', 
+            index='latitude', 
+            columns='longitude'
+        )
+        cs = ax1.contourf(pivot.columns, pivot.index, pivot, levels=15, cmap='RdYlBu_r')
+        ax1.scatter(spatial_grid['longitude'], spatial_grid['latitude'], 
+                   alpha=0.3, s=10, c='k')
+        ax1.set_xlabel('Longitude (°W)', fontsize=11)
+        ax1.set_ylabel('Latitude (°N)', fontsize=11)
+        ax1.set_title('Subsidence Rate (mm/yr)', fontsize=12, fontweight='bold')
+        cbar1 = plt.colorbar(cs, ax=ax1)
+        cbar1.set_label('mm/yr', fontsize=10)
+    
+    # Right: Uncertainty analysis (neighborhood std)
+    if 'neighborhood_std' in spatial_grid.columns:
+        pivot_unc = spatial_grid.pivot_table(
+            values='neighborhood_std',
+            index='latitude',
+            columns='longitude'
+        )
+        cs2 = ax2.contourf(pivot_unc.columns, pivot_unc.index, pivot_unc, 
+                          levels=15, cmap='viridis')
+        ax2.set_xlabel('Longitude (°W)', fontsize=11)
+        ax2.set_ylabel('Latitude (°N)', fontsize=11)
+        ax2.set_title('Neighborhood Std Dev (mm/yr)', fontsize=12, fontweight='bold')
+        cbar2 = plt.colorbar(cs2, ax=ax2)
+        cbar2.set_label('mm/yr', fontsize=10)
+    
+    plt.tight_layout()
+    fig.savefig(f'{output_dir}/04_Figure_Spatial_Contours_300dpi.png', dpi=300, bbox_inches='tight')
+    fig.savefig(f'{output_dir}/04_Figure_Spatial_Contours_600dpi.png', dpi=600, bbox_inches='tight')
+    plt.close()
+    logger.info("✓ Generated Figure 04A: Spatial Contours (300 & 600 DPI)")
+    print("✓ Generated Figure 04A: Spatial Contours", flush=True)
+
+
+def create_elevation_band_figure_fig04(spatial_grid, output_dir):
+    """Generate elevation band analysis figure"""
+    import matplotlib.pyplot as plt
+    
+    fig, ax = plt.subplots(figsize=(10, 6))
+    
+    # Group by elevation bands
+    if 'latitude' in spatial_grid.columns and 'rate_mm_yr' in spatial_grid.columns:
+        spatial_grid_copy = spatial_grid.copy()
+        
+        # Create elevation bands based on latitude (proxy for topography in this context)
+        # or use actual elevation if available
+        spatial_grid_copy['elev_band'] = pd.cut(
+            spatial_grid_copy['neighborhood_count'], 
+            bins=[0, 10, 20, 50, 100, 250, 1000],
+            labels=['Sparse\n(1-10)', 'Low\n(10-20)', 'Medium\n(20-50)',
+                   'High\n(50-100)', 'Very High\n(100-250)', 'Dense\n(250+)']
+        )
+        
+        # Create box plot
+        data_by_band = [group['rate_mm_yr'].values 
+                      for name, group in spatial_grid_copy.groupby('elev_band', observed=True)]
+        
+        bp = ax.boxplot(data_by_band, 
+                       labels=['Sparse\n(1-10)', 'Low\n(10-20)', 'Medium\n(20-50)',
+                              'High\n(50-100)', 'Very High\n(100-250)', 'Dense\n(250+)'],
+                       patch_artist=True)
+        
+        # Color boxes
+        for patch in bp['boxes']:
+            patch.set_facecolor('lightblue')
+        
+        ax.set_xlabel('Neighborhood Density', fontsize=11)
+        ax.set_ylabel('Subsidence Rate (mm/yr)', fontsize=11)
+        ax.set_title('Subsidence by Spatial Density', fontsize=12, fontweight='bold')
+        ax.grid(True, alpha=0.3, axis='y')
+    
+    plt.tight_layout()
+    fig.savefig(f'{output_dir}/04_Figure_Elevation_Band_Analysis.png', dpi=300, bbox_inches='tight')
+    plt.close()
+    logger.info("✓ Generated Figure 04B: Spatial Density Analysis (300 DPI)")
+    print("✓ Generated Figure 04B: Spatial Density Analysis", flush=True)
+
+
+# ============================================================================
+# FIGURE GENERATION
+# ============================================================================
+# Create figures directory
+import os
+figures_dir = OUTPUT_DIR / 'figures'
+os.makedirs(figures_dir, exist_ok=True)
+
+logger.info("\n" + "="*80)
+logger.info("GENERATING PUBLICATION FIGURES")
+logger.info("="*80)
+print("\n" + "="*80, flush=True)
+print("GENERATING PUBLICATION FIGURES", flush=True)
+print("="*80, flush=True)
+
+try:
+    create_spatial_contour_map_fig04(df_stats, figures_dir)
+    create_elevation_band_figure_fig04(df_stats, figures_dir)
+    logger.info("✓ All figures generated successfully")
+    print("\n✓ All figures generated successfully", flush=True)
+except Exception as e:
+    logger.warning(f"Figure generation warning: {e}")
+    print(f"⚠ Figure generation note: {e}", flush=True)
+
+logger.info("="*80)
+print("="*80, flush=True)
+
+# ============================================================================
 # FINAL SUMMARY
 # ============================================================================
-
 logger.info("="*80)
 logger.info("SCRIPT 04 COMPLETE")
 logger.info("="*80)

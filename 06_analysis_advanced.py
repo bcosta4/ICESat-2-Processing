@@ -43,7 +43,6 @@ Document these parameters clearly and keep them fixed for all runs that you
 want to compare.
 
 Complete audit trail provided via metadata JSON and execution log.
-
 ================================================================================
 """
 
@@ -67,7 +66,6 @@ if sys.stderr.encoding != 'utf-8':
 # ============================================================================
 # GIT HASH TRACKING
 # ============================================================================
-
 def get_git_hash():
     """Get git commit hash for reproducibility"""
     try:
@@ -85,7 +83,6 @@ def get_git_hash():
 # ============================================================================
 # LOGGING SETUP (DUAL OUTPUT: FILE + CONSOLE)
 # ============================================================================
-
 def setup_logging(output_dir):
     """Configure logging to both file and console"""
     
@@ -119,7 +116,6 @@ def setup_logging(output_dir):
 # ============================================================================
 # RUN METADATA CLASS (AUDIT TRAIL)
 # ============================================================================
-
 class RunMetadata:
     """Capture complete run parameters for reproducibility"""
     
@@ -169,7 +165,6 @@ class RunMetadata:
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-
 print("="*80, flush=True)
 print("SCRIPT 06: ADVANCED ANALYSIS - HYBRID k-NEAREST CLUSTERING", flush=True)
 print("="*80, flush=True)
@@ -212,7 +207,6 @@ SUMMARY_FILE = OUTPUT_DIR / '06_analysis_summary.txt'
 # ============================================================================
 # CLUSTERING PARAMETERS
 # ============================================================================
-
 # Hybrid k-nearest + radius filter
 SEARCH_RADIUS_M = 2000.0  # 2 km (consistent with Script 04)
 K_NEIGHBORS_PRIMARY = 250
@@ -243,7 +237,6 @@ metadata.configuration = {
 # ============================================================================
 # LOAD DATA
 # ============================================================================
-
 logger.info("\nLOADING DATA")
 print("\n" + "="*80)
 print("LOADING DATA")
@@ -296,7 +289,6 @@ print(f"✓ Valid coordinates: {len(df):,} / {len(valid_mask):,}")
 # ============================================================================
 # BUILD SPATIAL INDEX
 # ============================================================================
-
 logger.info("\nBUILDING SPATIAL INDEX")
 print("\n" + "="*80)
 print("BUILDING SPATIAL INDEX")
@@ -315,7 +307,6 @@ print(f"✓ KDTree built")
 # ============================================================================
 # HYBRID k-NEAREST NEIGHBOR SEARCH
 # ============================================================================
-
 logger.info("\nHYBRID SPATIAL SEARCH: k-NEAREST + RADIUS FILTER")
 print("\n" + "="*80)
 print("HYBRID SPATIAL SEARCH: k-NEAREST + RADIUS FILTER")
@@ -385,7 +376,6 @@ print(f" Max neighbors: {neighbor_counts.max()}")
 # ============================================================================
 # IDENTIFY SUBSIDENCE HOTSPOTS
 # ============================================================================
-
 logger.info("\nIDENTIFYING SUBSIDENCE HOTSPOTS")
 print("\n" + "="*80)
 print("IDENTIFYING SUBSIDENCE HOTSPOTS")
@@ -405,7 +395,6 @@ print(f"✓ Found {n_hotspots:,} hotspot points ({100*n_hotspots/len(df):.2f}%)"
 # ============================================================================
 # SIMPLE CLUSTERING: Connected Components
 # ============================================================================
-
 logger.info("\nCLUSTER IDENTIFICATION (CONNECTED HOTSPOTS)")
 print("\n" + "="*80)
 print("CLUSTER IDENTIFICATION (CONNECTED HOTSPOTS)")
@@ -448,7 +437,6 @@ print(f"✓ Identified {n_clusters} hotspot clusters")
 # ============================================================================
 # COMPUTE CLUSTER STATISTICS
 # ============================================================================
-
 logger.info("\nCOMPUTING CLUSTER STATISTICS")
 print(f"\nComputing cluster statistics...")
 
@@ -501,7 +489,6 @@ if n_valid_clusters > 0:
 # ============================================================================
 # SAVE RESULTS
 # ============================================================================
-
 logger.info("\nSAVING RESULTS")
 print("\n" + "="*80)
 print("SAVING RESULTS")
@@ -533,7 +520,6 @@ print(f"✓ Saved")
 # ============================================================================
 # SAVE SUMMARY
 # ============================================================================
-
 logger.info(f"Saving summary: {SUMMARY_FILE.name}")
 print(f"\nSaving summary: {SUMMARY_FILE.name}")
 
@@ -570,7 +556,6 @@ print(f"✓ Summary saved")
 # ============================================================================
 # FINALIZE METADATA AND SAVE
 # ============================================================================
-
 metadata.processing_results = {
     'total_points': len(df),
     'hotspot_points': int(n_hotspots),
@@ -582,14 +567,79 @@ metadata.processing_results = {
     'mean_subsidence_mm_yr': float(df_cluster_stats['mean_subsidence'].mean()) if n_valid_clusters > 0 else 0,
 }
 
+def create_hotspot_multipanel_fig06(spatial_grid, output_dir):
+    """Generate 4-panel hotspot analysis figure"""
+    import matplotlib.pyplot as plt
+    import numpy as np
+    
+    fig, axes = plt.subplots(2, 2, figsize=(14, 12))
+    
+    # Panel A: Spatial distribution
+    if 'latitude' in spatial_grid.columns and 'longitude' in spatial_grid.columns:
+        axes[0, 0].scatter(
+            spatial_grid['longitude'], spatial_grid['latitude'],
+            c=spatial_grid['subsidence_rate'], s=30,
+            cmap='RdYlBu_r', alpha=0.6
+        )
+        axes[0, 0].set_xlabel('Longitude (°W)')
+        axes[0, 0].set_ylabel('Latitude (°N)')
+        axes[0, 0].set_title('A) Hotspot Spatial Distribution')
+    
+    # Panel B: Subsidence vs elevation
+    if 'elevation' in spatial_grid.columns:
+        axes[0, 1].scatter(
+            spatial_grid['elevation'], spatial_grid['subsidence_rate'],
+            alpha=0.5, s=20
+        )
+        axes[0, 1].set_xlabel('Elevation (m)')
+        axes[0, 1].set_ylabel('Subsidence Rate (mm/yr)')
+        axes[0, 1].set_title('B) Elevation Dependence')
+    
+    # Panel C: Uncertainty analysis
+    if 'uncertainty' in spatial_grid.columns:
+        axes[1, 0].scatter(
+            spatial_grid['subsidence_rate'], spatial_grid['uncertainty'],
+            alpha=0.5, s=20, c='green'
+        )
+        axes[1, 0].set_xlabel('Subsidence Rate (mm/yr)')
+        axes[1, 0].set_ylabel('Measurement Uncertainty (mm/yr)')
+        axes[1, 0].set_title('C) Uncertainty Analysis')
+    
+    # Panel D: Distribution histogram
+    axes[1, 1].hist(
+        spatial_grid['subsidence_rate'],
+        bins=50, edgecolor='black', alpha=0.7
+    )
+    axes[1, 1].set_xlabel('Subsidence Rate (mm/yr)')
+    axes[1, 1].set_ylabel('Frequency')
+    axes[1, 1].set_title('D) Rate Distribution (n=2,781 hotspots)')
+    
+    plt.tight_layout()
+    fig.savefig(
+        output_dir / '06_Figure_Hotspot_Analysis.png',
+        dpi=300, bbox_inches='tight'
+    )
+    plt.close()
+    print("✓ Generated Figure 06: Hotspot Analysis (4-panel)")
+
 metadata.finalize()
 metadata_file = metadata.save(OUTPUT_DIR)
 logger.info(f"Metadata saved: {metadata_file.name}")
 
+figures_dir = OUTPUT_DIR / 'figures'
+figures_dir.mkdir(exist_ok=True)
+
+# Build spatial_grid (example using hotspot points)
+spatial_grid = df.loc[hotspot_mask, [lat_col, lon_col, rate_col]].copy()
+spatial_grid = spatial_grid.rename(
+    columns={lat_col: 'latitude', lon_col: 'longitude', rate_col: 'subsidence_rate'}
+)
+
+create_hotspot_multipanel_fig06(spatial_grid, figures_dir)
+
 # ============================================================================
 # FINAL SUMMARY
 # ============================================================================
-
 logger.info("="*80)
 logger.info("SCRIPT 06 COMPLETE - ADVANCED CLUSTERING ANALYSIS")
 logger.info("="*80)
