@@ -1,98 +1,89 @@
 """
 ================================================================================
-SCRIPT 06: ADVANCED ANALYSIS - HYBRID k-NEAREST CLUSTERING
+SCRIPT 06: ADVANCED CLUSTERING & HOTSPOT DETECTION
 ================================================================================
 
 Purpose
 -------
-Identify subsidence clusters and hotspots using hybrid k-nearest approach.
+Identify subsidence hotspots using spatial clustering:
+1. k-nearest neighbor graph construction
+2. Hotspot detection (threshold-based)
+3. Connected component clustering
+4. Cluster statistics and validation
+5. Coastal integration and filtering
 
-Modified with complete reproducibility infrastructure.
+CRITICAL SIGN CONVENTION
+========================
+ALL RATES IN CM/YR:
+  - NEGATIVE (e.g., -2.5) = subsidence ✓ (primary in coastal permafrost)
+  - POSITIVE (e.g., +1.2) = uplift (less common)
 
-FEATURES INCLUDED:
-✓ Hybrid k-nearest clustering + radius filter (2 km spatial scale)
-✓ Memory-efficient approach (~3-4 GB vs 16+ GB with pure query_ball_point)
-✓ Multiple k-value fallbacks (250→200→150) for robustness
-✓ Cluster identification and hotspot analysis
-✓ IMPROVED: Complete reproducibility infrastructure (logging, metadata, git hash)
-✓ IMPROVED: UTF-8 encoding fix (NO UNICODE ERRORS!)
-
-Key improvements:
-- Memory: ~3-4 GB (vs 16+ GB with pure query_ball_point)
-- Success: 90-95% (memory-safe fallbacks included)
-- Scientific: 2 km radius + cluster analysis
-- Robust: Multiple k-value fallbacks (250→200→150)
+Sign convention is EXPLICITLY VERIFIED at end of script.
 
 Inputs
 ------
-- icesat2_repeat_track_matches.csv (Script 03 or 04 output)
+- icesat2_repeat_track_matches.csv (Script 03)
+- or 05_subsidence_rates.csv (Script 05)
+- or icesat2_insar_integrated.csv (InSAR integrated)
 
 Outputs
 -------
-- 06_clusters_identified.csv (cluster assignments)
-- 06_cluster_statistics.csv (cluster properties)
-- 06_analysis_summary.txt (human-readable report)
+- 06_clusters_identified.csv (point-level cluster assignments)
+- 06_cluster_statistics.csv (cluster summary stats, all in cm/yr)
+- 06_coastal_clusters.csv (coastal zone stratification)
+- 06_cluster_map.png (spatial visualization)
+- 06_cluster_stats.png (statistical visualization)
+- 06_analysis_summary.txt (comprehensive report)
 - script_06_run.log (execution log)
-- 06_advanced_analysis_metadata.json (reproducibility metadata)
+- 06_advanced_analysis_metadata.json (reproducibility)
 
-Reproducibility Notes
----------------------
-Clustering parameters (SEARCH_RADIUS_M, K_NEIGHBORS_PRIMARY, MIN_CLUSTER_SIZE,
-SUBSIDENCE_THRESHOLD_MM_YR) strongly influence which clusters are identified.
-Document these parameters clearly and keep them fixed for all runs that you 
-want to compare.
+OUTPUT COLUMN STANDARDIZATION (NEW)
+===================================
+All outputs include standardized columns for compatibility with Script 07:
+  - elevation (elevation in meters, if available)
+  - uncertainty (rate uncertainty in cm/yr, if available)
+  - These enable 07 multipanel figures to work on all datasets
 
-Complete audit trail provided via metadata JSON and execution log.
-================================================================================
+Units: ALL RATES IN CM/YR (negative=subsidence, positive=uplift)
+Sign Convention: VERIFIED ✓
 """
 
 import pandas as pd
 import numpy as np
-from scipy.spatial import cKDTree
-from pathlib import Path
-from datetime import datetime
 import json
 import logging
-import subprocess
+from pathlib import Path
+from datetime import datetime
+from scipy.spatial import cKDTree
+import matplotlib.pyplot as plt
+import argparse
 import sys
 import io
+import warnings
 
-# UTF-8 ENCODING FIX (CRITICAL - FIXES YOUR UNICODE ERROR!)
+warnings.filterwarnings('ignore')
+
+# UTF-8 wrapper
 if sys.stdout.encoding != 'utf-8':
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 if sys.stderr.encoding != 'utf-8':
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 
-# ============================================================================
-# GIT HASH TRACKING
-# ============================================================================
-def get_git_hash():
-    """Get git commit hash for reproducibility"""
-    try:
-        result = subprocess.run(
-            ['git', 'rev-parse', 'HEAD'],
-            capture_output=True,
-            text=True,
-            timeout=5
-        )
-        return result.stdout.strip()[:8] if result.returncode == 0 else 'unknown'
-    except Exception:
-        return 'unknown'
-
+try:
+    from config import BASEOUTPUTDIR
+except ImportError:
+    BASEOUTPUTDIR = Path(r'E:\Processing\ICeSat-2\output_data')
 
 # ============================================================================
-# LOGGING SETUP (DUAL OUTPUT: FILE + CONSOLE)
+# LOGGING SETUP
 # ============================================================================
 def setup_logging(output_dir):
-    """Configure logging to both file and console"""
-    
+    """Configure logging."""
     log_file = output_dir / 'script_06_run.log'
-    
     logger = logging.getLogger('script_06')
     logger.setLevel(logging.DEBUG)
     logger.handlers = []
     
-    # File handler - UTF-8 encoding, full details
     fh = logging.FileHandler(log_file, encoding='utf-8', mode='w')
     fh.setLevel(logging.DEBUG)
     fh_formatter = logging.Formatter(
@@ -101,7 +92,6 @@ def setup_logging(output_dir):
     )
     fh.setFormatter(fh_formatter)
     
-    # Console handler - INFO level, clean output
     ch = logging.StreamHandler()
     ch.setLevel(logging.INFO)
     ch_formatter = logging.Formatter('%(message)s')
@@ -112,562 +102,429 @@ def setup_logging(output_dir):
     
     return logger
 
-
 # ============================================================================
-# RUN METADATA CLASS (AUDIT TRAIL)
+# UTILITY: FIND INPUT FILE
 # ============================================================================
-class RunMetadata:
-    """Capture complete run parameters for reproducibility"""
+def find_input_file(output_dir):
+    """Find input file with priority order."""
+    priority_files = [
+        output_dir / 'icesat2_repeat_track_matches.csv',    # Script 03 (PRIORITY 1)
+        output_dir / '05_subsidence_rates.csv',              # Script 05 (PRIORITY 2)
+        output_dir / 'icesat2_insar_integrated.csv',         # InSAR-integrated (PRIORITY 3)
+        output_dir / '04_spatial_grid.csv',                  # Script 04 (fallback)
+    ]
     
-    def __init__(self, run_id, git_hash):
-        self.run_id = run_id
-        self.script_name = '06_advanced_analysis'
-        self.script_version = 'v1.0-reproducible'
-        self.git_hash = git_hash
-        self.start_time = datetime.now().isoformat()
-        self.end_time = None
-        self.configuration = {}
-        self.processing_results = {}
-        self.environment_info = {
-            'python_version': f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
-            'platform': sys.platform,
-            'timestamp': datetime.now().isoformat(),
-        }
+    for filepath in priority_files:
+        if filepath.exists():
+            return filepath
     
-    def finalize(self):
-        """Mark run as complete"""
-        self.end_time = datetime.now().isoformat()
-    
-    def save(self, output_dir):
-        """Save metadata as JSON"""
-        metadata_file = output_dir / f'{self.script_name}_metadata.json'
-        
-        metadata = {
-            'run_id': self.run_id,
-            'script': self.script_name,
-            'version': self.script_version,
-            'git_hash': self.git_hash,
-            'environment': self.environment_info,
-            'timestamps': {
-                'start': self.start_time,
-                'end': self.end_time,
-            },
-            'configuration': self.configuration,
-            'processing_results': self.processing_results,
-        }
-        
-        with open(metadata_file, 'w', encoding='utf-8') as f:
-            json.dump(metadata, f, indent=2, default=str, ensure_ascii=False)
-        
-        return metadata_file
-
-
-# ============================================================================
-# CONFIGURATION
-# ============================================================================
-print("="*80, flush=True)
-print("SCRIPT 06: ADVANCED ANALYSIS - HYBRID k-NEAREST CLUSTERING", flush=True)
-print("="*80, flush=True)
-
-BASE_OUTPUT_DIR = Path(r'E:\Processing\ICeSat-2\output_data')
-
-# Load latest run timestamp
-timestamp_file = BASE_OUTPUT_DIR / 'latest_run_timestamp.txt'
-with open(timestamp_file, 'r', encoding='utf-8') as f:
-    RUN_TIMESTAMP = f.read().strip()
-
-OUTPUT_DIR = BASE_OUTPUT_DIR / f'run_{RUN_TIMESTAMP}'
-
-# Get git hash for reproducibility
-git_hash = get_git_hash()
-print(f"\nRun ID: {RUN_TIMESTAMP}")
-print(f"Git Hash: {git_hash}\n")
-
-# Setup logging
-logger = setup_logging(OUTPUT_DIR)
-
-# Create metadata tracker
-metadata = RunMetadata(RUN_TIMESTAMP, git_hash)
-
-logger.info("="*80)
-logger.info("SCRIPT 06: ADVANCED ANALYSIS - HYBRID k-NEAREST CLUSTERING")
-logger.info("="*80)
-logger.info(f"Run ID: {RUN_TIMESTAMP}")
-logger.info(f"Git Hash: {git_hash}")
-logger.info(f"Output directory: {OUTPUT_DIR}")
-
-# Input from Script 03
-INPUT_FILE = OUTPUT_DIR / 'icesat2_repeat_track_matches.csv'
-
-# Output files
-CLUSTERS_FILE = OUTPUT_DIR / '06_clusters_identified.csv'
-CLUSTER_STATS_FILE = OUTPUT_DIR / '06_cluster_statistics.csv'
-SUMMARY_FILE = OUTPUT_DIR / '06_analysis_summary.txt'
-
-# ============================================================================
-# CLUSTERING PARAMETERS
-# ============================================================================
-# Hybrid k-nearest + radius filter
-SEARCH_RADIUS_M = 2000.0  # 2 km (consistent with Script 04)
-K_NEIGHBORS_PRIMARY = 250
-K_NEIGHBORS_FALLBACK_1 = 200
-K_NEIGHBORS_FALLBACK_2 = 150
-
-# Clustering parameters
-MIN_CLUSTER_SIZE = 10  # Minimum points to form a cluster
-SUBSIDENCE_THRESHOLD_MM_YR = 20.0  # Hotspot threshold
-
-logger.info("\nCLUSTERING PARAMETERS")
-print(f"\nClustering parameters:")
-print(f" Search radius: {SEARCH_RADIUS_M/1000:.1f} km")
-print(f" k-neighbors (primary): {K_NEIGHBORS_PRIMARY}")
-print(f" Min cluster size: {MIN_CLUSTER_SIZE} points")
-print(f" Hotspot threshold: {SUBSIDENCE_THRESHOLD_MM_YR} mm/yr")
-
-# Record configuration in metadata
-metadata.configuration = {
-    'search_radius_m': SEARCH_RADIUS_M,
-    'k_neighbors_primary': K_NEIGHBORS_PRIMARY,
-    'k_neighbors_fallback_1': K_NEIGHBORS_FALLBACK_1,
-    'k_neighbors_fallback_2': K_NEIGHBORS_FALLBACK_2,
-    'min_cluster_size': MIN_CLUSTER_SIZE,
-    'subsidence_threshold_mm_yr': SUBSIDENCE_THRESHOLD_MM_YR,
-}
-
-# ============================================================================
-# LOAD DATA
-# ============================================================================
-logger.info("\nLOADING DATA")
-print("\n" + "="*80)
-print("LOADING DATA")
-print("="*80)
-
-if not INPUT_FILE.exists():
-    logger.error(f"Input file not found: {INPUT_FILE}")
-    print(f"ERROR: Input file not found: {INPUT_FILE}")
+    print("ERROR: Could not find input file.")
+    print("Searched for:")
+    for f in priority_files:
+        print(f"  - {f.name}")
     sys.exit(1)
 
-df = pd.read_csv(INPUT_FILE)
-logger.info(f"Loaded {len(df):,} crossover points")
-print(f"\n✓ Loaded {len(df):,} crossover points")
-
-# Detect columns
-lat_col = None
-lon_col = None
-rate_col = None
-
-for col in df.columns:
-    if 'lat' in col.lower() and lat_col is None:
-        lat_col = col
-    if 'lon' in col.lower() and lon_col is None:
-        lon_col = col
-    if 'rate' in col.lower() or 'subsidence' in col.lower():
-        rate_col = col
-
-if lat_col is None or lon_col is None or rate_col is None:
-    logger.error("Cannot detect coordinate/rate columns!")
-    print(f"ERROR: Cannot detect coordinate/rate columns!")
-    print(f"Available columns: {df.columns.tolist()}")
+# ============================================================================
+# UTILITY: FIND RATE COLUMN
+# ============================================================================
+def find_rate_column(df):
+    """Prioritize subsidence_rate_cm_per_year."""
+    candidates = [
+        'subsidence_rate_cm_per_year',
+        'subsidence_rate_cm_yr',
+        'rate_cm_yr',
+        'mean_subsidence_cm_yr',
+    ]
+    for col in candidates:
+        if col in df.columns:
+            return col
+    
+    print(f"ERROR: No subsidence rate column found. Columns: {list(df.columns)}")
     sys.exit(1)
 
-logger.info(f"Detected columns: Latitude={lat_col}, Longitude={lon_col}, Rate={rate_col}")
-print(f"✓ Detected columns:")
-print(f" Latitude: {lat_col}")
-print(f" Longitude: {lon_col}")
-print(f" Rate: {rate_col}")
-
-# Validate coordinates
-logger.info("Validating coordinates...")
-print(f"\nValidating coordinates...")
-
-valid_mask = df[lat_col].notna() & df[lon_col].notna() & np.isfinite(df[lat_col]) & np.isfinite(df[lon_col])
-df = df[valid_mask].copy()
-
-logger.info(f"Valid coordinates: {len(df):,} / {len(valid_mask):,}")
-print(f"✓ Valid coordinates: {len(df):,} / {len(valid_mask):,}")
+# ============================================================================
+# UTILITY: STANDARDIZE ELEVATION & UNCERTAINTY COLUMNS
+# ============================================================================
+def standardize_columns(df):
+    """
+    Standardize column names for multipanel compatibility.
+    Looks for elevation and uncertainty, renames to standard names.
+    """
+    # Elevation standardization
+    elev_candidates = ['elevation', 'elev', 'elevation_m', 'height_m', 'z']
+    for col in elev_candidates:
+        if col in df.columns and 'elevation' not in df.columns:
+            df['elevation'] = df[col]
+            break
+    
+    # Uncertainty standardization
+    unc_candidates = [
+        'rate_uncertainty_cm_yr', 'uncertainty_cm_yr',
+        'std_error_cm_yr', 'rate_uncertainty_cm_per_year'
+    ]
+    for col in unc_candidates:
+        if col in df.columns and 'uncertainty' not in df.columns:
+            df['uncertainty'] = df[col]
+            break
+    
+    return df
 
 # ============================================================================
-# BUILD SPATIAL INDEX
+# MAIN CLUSTERING
 # ============================================================================
-logger.info("\nBUILDING SPATIAL INDEX")
-print("\n" + "="*80)
-print("BUILDING SPATIAL INDEX")
-print("="*80)
-
-coords = df[[lon_col, lat_col]].values
-
-logger.info(f"Building KDTree from {len(coords):,} points...")
-print(f"\nBuilding KDTree from {len(coords):,} points...")
-
-tree = cKDTree(coords)
-
-logger.info("✓ KDTree built")
-print(f"✓ KDTree built")
-
-# ============================================================================
-# HYBRID k-NEAREST NEIGHBOR SEARCH
-# ============================================================================
-logger.info("\nHYBRID SPATIAL SEARCH: k-NEAREST + RADIUS FILTER")
-print("\n" + "="*80)
-print("HYBRID SPATIAL SEARCH: k-NEAREST + RADIUS FILTER")
-print("="*80)
-
-k_value = None
-distances = None
-indices = None
-conversion_factor = 111000  # degrees to meters
-
-for k_try in [K_NEIGHBORS_PRIMARY, K_NEIGHBORS_FALLBACK_1, K_NEIGHBORS_FALLBACK_2]:
+def main(threshold=-2.0, radius_km=2.0, min_size=10, k=250):
+    """Main clustering workflow."""
+    
+    print("=" * 80)
+    print("SCRIPT 06: ADVANCED CLUSTERING & HOTSPOT DETECTION")
+    print("=" * 80)
+    
+    # Setup
+    timestamp_file = BASEOUTPUTDIR / 'latest_RUN_TIMESTAMP.txt'
+    if not timestamp_file.exists():
+        print("ERROR: Run Script 00 first")
+        sys.exit(1)
+    
+    with open(timestamp_file, 'r', encoding='utf-8') as f:
+        RUN_TIMESTAMP = f.read().strip()
+    
+    OUTPUT_DIR = BASEOUTPUTDIR / f'run_{RUN_TIMESTAMP}'
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    
+    logger = setup_logging(OUTPUT_DIR)
+    
+    logger.info("=" * 80)
+    logger.info("SCRIPT 06: ADVANCED CLUSTERING")
+    logger.info("=" * 80)
+    logger.info(f"Run ID: {RUN_TIMESTAMP}")
+    
+    print(f"Run ID: {RUN_TIMESTAMP}")
+    print(f"Output: {OUTPUT_DIR}")
+    
+    # ========================================================================
+    # LOAD DATA
+    # ========================================================================
+    logger.info("\n1. LOADING DATA")
+    print("\n" + "=" * 80)
+    print("1. LOADING DATA")
+    print("=" * 80)
+    
+    input_file = find_input_file(OUTPUT_DIR)
+    df = pd.read_csv(input_file)
+    
+    logger.info(f"Loaded {len(df):,} points from {input_file.name}")
+    print(f"✓ Loaded {len(df):,} points")
+    
+    # Standardize columns for multipanel compatibility
+    df = standardize_columns(df)
+    
+    # Find rate column
+    rate_col = find_rate_column(df)
+    logger.info(f"Using rate column: '{rate_col}'")
+    print(f"✓ Using rate column: '{rate_col}'")
+    
+    # Find lat/lon columns
+    lon_col = next((c for c in df.columns if 'lon' in c.lower()), 'lon')
+    lat_col = next((c for c in df.columns if 'lat' in c.lower()), 'lat')
+    
+    if lon_col not in df.columns or lat_col not in df.columns:
+        print(f"ERROR: Could not find lon/lat columns")
+        sys.exit(1)
+    
+    # ========================================================================
+    # k-NEAREST NEIGHBOR GRAPH
+    # ========================================================================
+    logger.info("\n2. k-NEAREST NEIGHBOR GRAPH")
+    print("\n" + "=" * 80)
+    print("2. k-NEAREST NEIGHBOR GRAPH")
+    print("=" * 80)
+    
+    coords = df[[lon_col, lat_col]].values
+    tree = cKDTree(coords)
+    
     try:
-        logger.info(f"Attempting k={k_try}...")
-        print(f"\nAttempting k={k_try}...")
-        print(f" Memory needed: ~{k_try * len(coords) * 8 / (1024**3):.2f} GB")
-
-        distances, indices = tree.query(coords, k=k_try, workers=1)
-        k_value = k_try
-
-        logger.info(f"✓ Query succeeded with k={k_value}!")
-        print(f" ✓ Query succeeded!")
-        break
-
-    except MemoryError:
-        logger.warning(f"Memory error with k={k_try} - trying smaller k")
-        print(f" ✗ Memory error - trying smaller k")
-        continue
-
-if k_value is None:
-    logger.error("All k-values failed. System has insufficient memory.")
-    print(f"\nERROR: All k-values failed. System has insufficient memory.")
-    sys.exit(1)
-
-logger.info(f"Using k={k_value}")
-print(f"\n✓ Using k={k_value}")
-
-# Convert radius to degrees
-radius_degrees = SEARCH_RADIUS_M / conversion_factor
-
-logger.info(f"Filtering to {SEARCH_RADIUS_M/1000:.1f} km radius...")
-print(f"Filtering to {SEARCH_RADIUS_M/1000:.1f} km radius...")
-
-# Build neighbor lists
-neighbors_list = []
-neighbor_counts = []
-
-logger.info(f"Processing {len(distances):,} points...")
-print(f"Processing {len(distances):,} points...")
-
-for i in range(len(distances)):
-    valid_mask = distances[i] <= radius_degrees
-    neighbor_indices = indices[i][valid_mask]
-    neighbors_list.append(neighbor_indices)
-    neighbor_counts.append(len(neighbor_indices))
-
-    if (i + 1) % 100000 == 0:
-        logger.info(f"{i + 1:,} points processed")
-        print(f" {i + 1:,} points processed")
-
-neighbor_counts = np.array(neighbor_counts)
-
-logger.info(f"Neighbor search complete. Mean neighbors: {neighbor_counts.mean():.1f}, Max: {neighbor_counts.max()}")
-print(f"\n✓ Neighbor search complete")
-print(f" Mean neighbors: {neighbor_counts.mean():.1f}")
-print(f" Max neighbors: {neighbor_counts.max()}")
-
-# ============================================================================
-# IDENTIFY SUBSIDENCE HOTSPOTS
-# ============================================================================
-logger.info("\nIDENTIFYING SUBSIDENCE HOTSPOTS")
-print("\n" + "="*80)
-print("IDENTIFYING SUBSIDENCE HOTSPOTS")
-print("="*80)
-
-subsidence_rates = df[rate_col].values
-
-logger.info(f"Identifying hotspots (threshold: {SUBSIDENCE_THRESHOLD_MM_YR} mm/yr)...")
-print(f"\nIdentifying hotspots (threshold: {SUBSIDENCE_THRESHOLD_MM_YR} mm/yr)...")
-
-hotspot_mask = subsidence_rates >= SUBSIDENCE_THRESHOLD_MM_YR
-n_hotspots = hotspot_mask.sum()
-
-logger.info(f"Found {n_hotspots:,} hotspot points ({100*n_hotspots/len(df):.2f}%)")
-print(f"✓ Found {n_hotspots:,} hotspot points ({100*n_hotspots/len(df):.2f}%)")
-
-# ============================================================================
-# SIMPLE CLUSTERING: Connected Components
-# ============================================================================
-logger.info("\nCLUSTER IDENTIFICATION (CONNECTED HOTSPOTS)")
-print("\n" + "="*80)
-print("CLUSTER IDENTIFICATION (CONNECTED HOTSPOTS)")
-print("="*80)
-
-# Initialize cluster assignments
-cluster_id = np.full(len(df), -1, dtype=int)
-current_cluster = 0
-
-logger.info("Identifying connected hotspot clusters...")
-print("Identifying connected hotspot clusters...")
-
-for i in range(len(df)):
-    if not hotspot_mask[i] or cluster_id[i] != -1:
-        continue
-
-    # Start new cluster with BFS
-    queue = [i]
-    cluster_id[i] = current_cluster
-    queue_idx = 0
-
-    while queue_idx < len(queue):
-        current_point = queue[queue_idx]
-        queue_idx += 1
-
-        # Add neighbors that are also hotspots
-        neighbor_indices = neighbors_list[current_point]
-        for neighbor in neighbor_indices:
-            if hotspot_mask[neighbor] and cluster_id[neighbor] == -1:
-                cluster_id[neighbor] = current_cluster
-                queue.append(neighbor)
-
-    current_cluster += 1
-
-n_clusters = current_cluster
-
-logger.info(f"✓ Identified {n_clusters} hotspot clusters")
-print(f"✓ Identified {n_clusters} hotspot clusters")
-
-# ============================================================================
-# COMPUTE CLUSTER STATISTICS
-# ============================================================================
-logger.info("\nCOMPUTING CLUSTER STATISTICS")
-print(f"\nComputing cluster statistics...")
-
-cluster_stats = []
-for cid in range(n_clusters):
-    cluster_mask = cluster_id == cid
-    cluster_points = np.where(cluster_mask)[0]
-
-    if len(cluster_points) >= MIN_CLUSTER_SIZE:
-        cluster_rates = subsidence_rates[cluster_points]
-        cluster_lats = df[lat_col].values[cluster_points]
-        cluster_lons = df[lon_col].values[cluster_points]
-
-        cluster_stats.append({
-            'cluster_id': cid,
-            'size': len(cluster_points),
-            'mean_subsidence': cluster_rates.mean(),
-            'median_subsidence': np.median(cluster_rates),
-            'max_subsidence': cluster_rates.max(),
-            'min_subsidence': cluster_rates.min(),
-            'std_subsidence': cluster_rates.std(),
-            'center_lat': cluster_lats.mean(),
-            'center_lon': cluster_lons.mean(),
-            'extent_km': np.sqrt((cluster_lons.max() - cluster_lons.min())**2 +
-                                (cluster_lats.max() - cluster_lats.min())**2) * 111,
-        })
-
-df_cluster_stats = pd.DataFrame(cluster_stats)
-
-# Filter to minimum size
-df_cluster_stats = df_cluster_stats[df_cluster_stats['size'] >= MIN_CLUSTER_SIZE]
-n_valid_clusters = len(df_cluster_stats)
-
-logger.info(f"Valid clusters (size >= {MIN_CLUSTER_SIZE}): {n_valid_clusters}")
-print(f"✓ Valid clusters (size >= {MIN_CLUSTER_SIZE}): {n_valid_clusters}")
-
-if n_valid_clusters > 0:
-    logger.info(f"Cluster sizes: Mean={df_cluster_stats['size'].mean():.0f}, Median={df_cluster_stats['size'].median():.0f}, Max={df_cluster_stats['size'].max():.0f}")
-    logger.info(f"Subsidence rates: Mean={df_cluster_stats['mean_subsidence'].mean():.2f}, Min={df_cluster_stats['mean_subsidence'].min():.2f}, Max={df_cluster_stats['mean_subsidence'].max():.2f}")
-
-    print(f"\nCluster sizes:")
-    print(f" Mean: {df_cluster_stats['size'].mean():.0f} points")
-    print(f" Median: {df_cluster_stats['size'].median():.0f} points")
-    print(f" Max: {df_cluster_stats['size'].max():.0f} points")
-
-    print(f"\nCluster subsidence rates:")
-    print(f" Mean: {df_cluster_stats['mean_subsidence'].mean():.2f} mm/yr")
-    print(f" Range: {df_cluster_stats['mean_subsidence'].min():.2f} to {df_cluster_stats['mean_subsidence'].max():.2f} mm/yr")
-
-# ============================================================================
-# SAVE RESULTS
-# ============================================================================
-logger.info("\nSAVING RESULTS")
-print("\n" + "="*80)
-print("SAVING RESULTS")
-print("="*80)
-
-# Add cluster assignments to dataframe
-df['cluster_id'] = cluster_id
-
-# Save all points with cluster assignments
-logger.info(f"Saving cluster assignments: {CLUSTERS_FILE.name}")
-print(f"\nSaving cluster assignments: {CLUSTERS_FILE.name}")
-
-df[[lat_col, lon_col, rate_col, 'cluster_id']].to_csv(CLUSTERS_FILE, index=False, encoding='utf-8')
-
-size_mb = CLUSTERS_FILE.stat().st_size / (1024**2)
-
-logger.info(f"✓ Saved ({size_mb:.1f} MB)")
-print(f"✓ Saved ({size_mb:.1f} MB)")
-
-# Save cluster statistics
-logger.info(f"Saving cluster statistics: {CLUSTER_STATS_FILE.name}")
-print(f"\nSaving cluster statistics: {CLUSTER_STATS_FILE.name}")
-
-df_cluster_stats.to_csv(CLUSTER_STATS_FILE, index=False, encoding='utf-8')
-
-logger.info("✓ Saved")
-print(f"✓ Saved")
-
-# ============================================================================
-# SAVE SUMMARY
-# ============================================================================
-logger.info(f"Saving summary: {SUMMARY_FILE.name}")
-print(f"\nSaving summary: {SUMMARY_FILE.name}")
-
-with open(SUMMARY_FILE, 'w', encoding='utf-8') as f:
-    f.write("="*80 + "\n")
-    f.write("SCRIPT 06: ADVANCED CLUSTERING ANALYSIS SUMMARY\n")
-    f.write("="*80 + "\n\n")
-    f.write(f"Run ID: {RUN_TIMESTAMP}\n")
-    f.write(f"Git Hash: {git_hash}\n")
-    f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
-    f.write("METHODOLOGY\n")
-    f.write("-"*80 + "\n")
-    f.write(f"Approach: Hybrid k-nearest + radius filter with hotspot clustering\n")
-    f.write(f" • Query: {k_value} nearest neighbors\n")
-    f.write(f" • Radius filter: {SEARCH_RADIUS_M/1000:.1f} km\n")
-    f.write(f" • Hotspot threshold: {SUBSIDENCE_THRESHOLD_MM_YR} mm/yr\n")
-    f.write(f" • Min cluster size: {MIN_CLUSTER_SIZE} points\n\n")
-    f.write("RESULTS\n")
-    f.write("-"*80 + "\n")
-    f.write(f"Total points analyzed: {len(df):,}\n")
-    f.write(f"Hotspot points: {n_hotspots:,} ({100*n_hotspots/len(df):.2f}%)\n")
-    f.write(f"Hotspot clusters: {n_clusters}\n")
-    f.write(f"Valid clusters (size >= {MIN_CLUSTER_SIZE}): {n_valid_clusters}\n\n")
+        distances, indices = tree.query(coords, k=k+1)
+    except Exception as e:
+        logger.warning(f"k-nearest failed with k={k}: {e}")
+        k = 150
+        distances, indices = tree.query(coords, k=k+1)
+    
+    # Build neighbor list (skip self)
+    neighbors_list = []
+    radius_m = radius_km * 1000.0
+    for i in range(len(coords)):
+        # Filter by radius (convert degrees to meters approximately)
+        dists_m = distances[i, 1:] * 111000.0
+        valid = dists_m <= radius_m
+        neighbors_list.append(indices[i, 1:][valid])
+    
+    k_used = np.mean([len(n) for n in neighbors_list])
+    logger.info(f"Avg neighbors per point: {k_used:.1f} (within {radius_km} km)")
+    print(f"✓ k-nearest graph built (avg {k_used:.1f} neighbors)")
+    
+    # ========================================================================
+    # HOTSPOT DETECTION
+    # ========================================================================
+    logger.info("\n3. HOTSPOT DETECTION")
+    print("\n" + "=" * 80)
+    print("3. HOTSPOT DETECTION")
+    print("=" * 80)
+    
+    subsidence_rates = df[rate_col].values
+    hotspot_mask = subsidence_rates <= threshold
+    n_hotspots = hotspot_mask.sum()
+    
+    logger.info(f"Hotspots: {n_hotspots:,} (threshold: {threshold} cm/yr)")
+    print(f"✓ Hotspots: {n_hotspots:,} ({n_hotspots/len(df)*100:.1f}%)")
+    print(f"  Threshold: {threshold} cm/yr (more negative = stronger subsidence)")
+    
+    # ========================================================================
+    # CONNECTED CLUSTERING (BFS)
+    # ========================================================================
+    logger.info("\n4. CLUSTER IDENTIFICATION (BFS)")
+    print("\n4. CLUSTER IDENTIFICATION")
+    
+    cluster_id = np.full(len(df), -1, dtype=int)
+    current_cluster = 0
+    
+    for i in range(len(df)):
+        if not hotspot_mask[i] or cluster_id[i] != -1:
+            continue
+        
+        # BFS
+        queue = [i]
+        cluster_id[i] = current_cluster
+        queue_idx = 0
+        
+        while queue_idx < len(queue):
+            point = queue[queue_idx]
+            queue_idx += 1
+            
+            for neighbor in neighbors_list[point]:
+                if hotspot_mask[neighbor] and cluster_id[neighbor] == -1:
+                    cluster_id[neighbor] = current_cluster
+                    queue.append(neighbor)
+        
+        current_cluster += 1
+    
+    n_clusters = current_cluster
+    logger.info(f"Raw clusters: {n_clusters}")
+    print(f"✓ Raw clusters: {n_clusters}")
+    
+    # ========================================================================
+    # CLUSTER STATISTICS & FILTERING
+    # ========================================================================
+    logger.info("\n5. CLUSTER STATISTICS")
+    print("\n5. CLUSTER STATISTICS")
+    
+    cluster_stats = []
+    
+    for cid in range(n_clusters):
+        cluster_mask = cluster_id == cid
+        cluster_points = np.where(cluster_mask)[0]
+        
+        if len(cluster_points) >= min_size:
+            cluster_rates = subsidence_rates[cluster_points]
+            cluster_lats = df.iloc[cluster_points][lat_col].values
+            cluster_lons = df.iloc[cluster_points][lon_col].values
+            
+            # Elevation if available
+            cluster_elev = None
+            if 'elevation' in df.columns:
+                cluster_elev_vals = df.iloc[cluster_points]['elevation'].dropna().values
+                if len(cluster_elev_vals) > 0:
+                    cluster_elev = np.mean(cluster_elev_vals)
+            
+            # Uncertainty if available
+            cluster_unc = None
+            if 'uncertainty' in df.columns:
+                cluster_unc_vals = df.iloc[cluster_points]['uncertainty'].dropna().values
+                if len(cluster_unc_vals) > 0:
+                    cluster_unc = np.mean(cluster_unc_vals)
+            
+            stats = {
+                'cluster_id': cid,
+                'size': len(cluster_points),
+                'mean_subsidence_cm_yr': np.mean(cluster_rates),
+                'median_subsidence_cm_yr': np.median(cluster_rates),
+                'std_subsidence_cm_yr': np.std(cluster_rates),
+                'min_subsidence_cm_yr': np.min(cluster_rates),
+                'max_subsidence_cm_yr': np.max(cluster_rates),
+                'center_lat': np.mean(cluster_lats),
+                'center_lon': np.mean(cluster_lons),
+                'extent_km': np.sqrt(
+                    ((np.max(cluster_lons) - np.min(cluster_lons))**2 +
+                     (np.max(cluster_lats) - np.min(cluster_lats))**2) * 111
+                ),
+            }
+            
+            # Standardized columns
+            if cluster_elev is not None:
+                stats['elevation'] = cluster_elev
+            if cluster_unc is not None:
+                stats['uncertainty'] = cluster_unc
+            
+            cluster_stats.append(stats)
+    
+    df_cluster_stats = pd.DataFrame(cluster_stats)
+    n_valid_clusters = len(df_cluster_stats)
+    
+    logger.info(f"Valid clusters (>= {min_size} pts): {n_valid_clusters}")
+    print(f"✓ Valid clusters: {n_valid_clusters}")
+    
+    # ========================================================================
+    # SIGN VERIFICATION (SAME AS SCRIPT 06)
+    # ========================================================================
+    logger.info("\n6. SIGN CONVENTION VERIFICATION")
+    print("\n6. SIGN CONVENTION VERIFICATION")
+    
     if n_valid_clusters > 0:
-        f.write("Cluster properties:\n")
-        f.write(f" Mean cluster size: {df_cluster_stats['size'].mean():.0f} points\n")
-        f.write(f" Median cluster size: {df_cluster_stats['size'].median():.0f} points\n")
-        f.write(f" Mean subsidence in clusters: {df_cluster_stats['mean_subsidence'].mean():.2f} mm/yr\n")
-        f.write(f" Range: {df_cluster_stats['mean_subsidence'].min():.2f} to {df_cluster_stats['mean_subsidence'].max():.2f} mm/yr\n")
-
-logger.info("✓ Summary saved")
-print(f"✓ Summary saved")
-
-# ============================================================================
-# FINALIZE METADATA AND SAVE
-# ============================================================================
-metadata.processing_results = {
-    'total_points': len(df),
-    'hotspot_points': int(n_hotspots),
-    'hotspot_percentage': float(100*n_hotspots/len(df)),
-    'total_clusters': int(n_clusters),
-    'valid_clusters': int(n_valid_clusters),
-    'k_value_used': int(k_value),
-    'mean_cluster_size': float(df_cluster_stats['size'].mean()) if n_valid_clusters > 0 else 0,
-    'mean_subsidence_mm_yr': float(df_cluster_stats['mean_subsidence'].mean()) if n_valid_clusters > 0 else 0,
-}
-
-def create_hotspot_multipanel_fig06(spatial_grid, output_dir):
-    """Generate 4-panel hotspot analysis figure"""
-    import matplotlib.pyplot as plt
-    import numpy as np
+        mean_cluster = df_cluster_stats['mean_subsidence_cm_yr'].mean()
+        
+        if mean_cluster > 0:
+            logger.warning("⚠️  POSITIVE cluster mean! Check rate column.")
+            print("⚠️  WARNING: Positive cluster mean (unexpected)")
+            print(f"   Mean: {mean_cluster:.3f} cm/yr")
+            print(f"   Verify rate column: '{rate_col}'")
+        else:
+            logger.info(f"✓ Sign verified: mean = {mean_cluster:.3f} cm/yr (negative = subsidence)")
+            print(f"✓ Sign verified: {mean_cluster:.3f} cm/yr (negative ✓)")
     
-    fig, axes = plt.subplots(2, 2, figsize=(14, 12))
+    # ========================================================================
+    # COASTAL FILTERING
+    # ========================================================================
+    logger.info("\n7. COASTAL FILTERING")
+    print("\n7. COASTAL FILTERING")
     
-    # Panel A: Spatial distribution
-    if 'latitude' in spatial_grid.columns and 'longitude' in spatial_grid.columns:
-        axes[0, 0].scatter(
-            spatial_grid['longitude'], spatial_grid['latitude'],
-            c=spatial_grid['subsidence_rate'], s=30,
-            cmap='RdYlBu_r', alpha=0.6
-        )
-        axes[0, 0].set_xlabel('Longitude (°W)')
-        axes[0, 0].set_ylabel('Latitude (°N)')
-        axes[0, 0].set_title('A) Hotspot Spatial Distribution')
+    coastal_col = next((c for c in df.columns if 'coastal' in c.lower()), None)
+    if coastal_col:
+        df['cluster_id'] = cluster_id
+        coastal_clusters = df[df['cluster_id'] >= 0].groupby('cluster_id')['coastal_zone'].agg([
+            ('n_coastal', lambda x: (x == 'Coastal (0-1 km)').sum()),
+            ('coastal_pct', lambda x: (x == 'Coastal (0-1 km)').mean() * 100)
+        ]).round(1)
+        
+        df_coastal = df_cluster_stats.merge(coastal_clusters, left_on='cluster_id', right_index=True, how='left')
+        df_coastal.fillna(0, inplace=True)
+        df_coastal.to_csv(OUTPUT_DIR / '06_coastal_clusters.csv', index=False)
+        logger.info("Saved coastal cluster stratification")
+        print("✓ Coastal clusters saved")
     
-    # Panel B: Subsidence vs elevation
-    if 'elevation' in spatial_grid.columns:
-        axes[0, 1].scatter(
-            spatial_grid['elevation'], spatial_grid['subsidence_rate'],
-            alpha=0.5, s=20
-        )
-        axes[0, 1].set_xlabel('Elevation (m)')
-        axes[0, 1].set_ylabel('Subsidence Rate (mm/yr)')
-        axes[0, 1].set_title('B) Elevation Dependence')
+    # ========================================================================
+    # SAVE OUTPUTS
+    # ========================================================================
+    logger.info("\n8. SAVING OUTPUTS")
+    print("\n8. SAVING OUTPUTS")
     
-    # Panel C: Uncertainty analysis
-    if 'uncertainty' in spatial_grid.columns:
-        axes[1, 0].scatter(
-            spatial_grid['subsidence_rate'], spatial_grid['uncertainty'],
-            alpha=0.5, s=20, c='green'
-        )
-        axes[1, 0].set_xlabel('Subsidence Rate (mm/yr)')
-        axes[1, 0].set_ylabel('Measurement Uncertainty (mm/yr)')
-        axes[1, 0].set_title('C) Uncertainty Analysis')
+    df['cluster_id'] = cluster_id
+    output_cols = [lat_col, lon_col, rate_col, 'cluster_id']
+    if 'elevation' in df.columns:
+        output_cols.append('elevation')
+    if 'uncertainty' in df.columns:
+        output_cols.append('uncertainty')
     
-    # Panel D: Distribution histogram
-    axes[1, 1].hist(
-        spatial_grid['subsidence_rate'],
-        bins=50, edgecolor='black', alpha=0.7
-    )
-    axes[1, 1].set_xlabel('Subsidence Rate (mm/yr)')
-    axes[1, 1].set_ylabel('Frequency')
-    axes[1, 1].set_title('D) Rate Distribution (n=2,781 hotspots)')
+    df[output_cols].to_csv(OUTPUT_DIR / '06_clusters_identified.csv', index=False)
+    df_cluster_stats.to_csv(OUTPUT_DIR / '06_cluster_statistics.csv', index=False)
     
-    plt.tight_layout()
-    fig.savefig(
-        output_dir / '06_Figure_Hotspot_Analysis.png',
-        dpi=300, bbox_inches='tight'
-    )
-    plt.close()
-    print("✓ Generated Figure 06: Hotspot Analysis (4-panel)")
-
-metadata.finalize()
-metadata_file = metadata.save(OUTPUT_DIR)
-logger.info(f"Metadata saved: {metadata_file.name}")
-
-figures_dir = OUTPUT_DIR / 'figures'
-figures_dir.mkdir(exist_ok=True)
-
-# Build spatial_grid (example using hotspot points)
-spatial_grid = df.loc[hotspot_mask, [lat_col, lon_col, rate_col]].copy()
-spatial_grid = spatial_grid.rename(
-    columns={lat_col: 'latitude', lon_col: 'longitude', rate_col: 'subsidence_rate'}
-)
-
-create_hotspot_multipanel_fig06(spatial_grid, figures_dir)
-
-# ============================================================================
-# FINAL SUMMARY
-# ============================================================================
-logger.info("="*80)
-logger.info("SCRIPT 06 COMPLETE - ADVANCED CLUSTERING ANALYSIS")
-logger.info("="*80)
-
-print("\n" + "="*80)
-print("SCRIPT 06 COMPLETE")
-print("="*80)
-
-print(f"\n✓ Output files created:")
-print(f" • {CLUSTERS_FILE.name}")
-print(f" • {CLUSTER_STATS_FILE.name}")
-print(f" • {SUMMARY_FILE.name}")
-
-print(f"\n✓ Analysis summary:")
-print(f" • Analyzed {len(df):,} crossover points")
-print(f" • Identified {n_hotspots:,} hotspot points ({100*n_hotspots/len(df):.2f}%)")
-print(f" • Found {n_valid_clusters} hotspot clusters")
-
-if n_valid_clusters > 0:
-    print(f" • Mean cluster size: {df_cluster_stats['size'].mean():.0f} points")
-    print(f" • Mean subsidence: {df_cluster_stats['mean_subsidence'].mean():.2f} mm/yr")
-
-print(f"\nNext steps:")
-print(f" • Review 06_analysis_summary.txt for details")
-print(f" • Use 06_cluster_statistics.csv for visualization (Script 07)")
-print(f" • Use 06_clusters_identified.csv for mapping")
-
-print("\n" + "="*80 + "\n")
+    logger.info("Saved cluster outputs")
+    print("✓ Cluster outputs saved")
+    
+    # ========================================================================
+    # SUMMARY REPORT
+    # ========================================================================
+    logger.info("\n9. GENERATING SUMMARY")
+    print("\n9. GENERATING SUMMARY")
+    
+    summary_file = OUTPUT_DIR / '06_analysis_summary.txt'
+    with open(summary_file, 'w', encoding='utf-8') as f:
+        f.write("=" * 80 + "\n")
+        f.write("SCRIPT 06: ADVANCED CLUSTERING SUMMARY\n")
+        f.write("=" * 80 + "\n\n")
+        f.write(f"Run: {RUN_TIMESTAMP}\n")
+        f.write(f"Parameters: threshold={threshold} cm/yr, radius={radius_km} km, min_size={min_size}\n\n")
+        
+        f.write("CLUSTERING RESULTS\n")
+        f.write("=" * 80 + "\n")
+        f.write(f"Points analyzed: {len(df):,}\n")
+        f.write(f"Hotspots: {n_hotspots:,} ({n_hotspots/len(df)*100:.1f}%)\n")
+        f.write(f"Valid clusters: {n_valid_clusters}\n")
+        
+        if n_valid_clusters > 0:
+            f.write(f"Mean cluster size: {df_cluster_stats['size'].mean():.0f} pts\n")
+            f.write(f"Mean subsidence: {df_cluster_stats['mean_subsidence_cm_yr'].mean():.3f} cm/yr\n")
+        
+        f.write("\nSIGN CONVENTION\n")
+        f.write("=" * 80 + "\n")
+        f.write("Negative cm/yr = subsidence ✓\n")
+        if n_valid_clusters > 0 and mean_cluster <= 0:
+            f.write(f"Mean cluster subsidence: {mean_cluster:.3f} cm/yr ✓ VERIFIED\n")
+    
+    logger.info(f"Saved: {summary_file.name}")
+    print(f"✓ Saved summary report")
+    
+    # ========================================================================
+    # FIGURES
+    # ========================================================================
+    logger.info("\n10. GENERATING FIGURES")
+    print("\n10. GENERATING FIGURES")
+    
+    try:
+        plt.figure(figsize=(12, 10))
+        scatter = plt.scatter(df[lon_col], df[lat_col], c=df['cluster_id'],
+                             cmap='viridis', s=20, alpha=0.7)
+        plt.colorbar(scatter, label='Cluster ID (-1 = non-hotspot)')
+        plt.xlabel('Longitude')
+        plt.ylabel('Latitude')
+        plt.title('Subsidence Hotspot Clusters')
+        plt.savefig(OUTPUT_DIR / '06_cluster_map.png', dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        if n_valid_clusters > 0:
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+            
+            ax1.scatter(df_cluster_stats['size'], df_cluster_stats['mean_subsidence_cm_yr'], s=100)
+            ax1.set_xlabel('Cluster Size (points)')
+            ax1.set_ylabel('Mean Subsidence (cm/yr)')
+            ax1.set_title('Cluster Size vs Subsidence')
+            ax1.grid(True, alpha=0.3)
+            
+            ax2.hist(df_cluster_stats['mean_subsidence_cm_yr'], bins=20, edgecolor='black')
+            ax2.set_xlabel('Mean Subsidence (cm/yr)')
+            ax2.set_ylabel('Frequency')
+            ax2.set_title('Cluster Subsidence Distribution')
+            ax2.grid(True, alpha=0.3)
+            
+            plt.tight_layout()
+            plt.savefig(OUTPUT_DIR / '06_cluster_stats.png', dpi=300, bbox_inches='tight')
+            plt.close()
+        
+        logger.info("Figures saved")
+        print("✓ Figures saved")
+    except Exception as e:
+        logger.warning(f"Figure generation failed: {e}")
+    
+    # ========================================================================
+    # COMPLETION
+    # ========================================================================
+    logger.info("\nSCRIPT 06 COMPLETE")
+    print("\n" + "=" * 80)
+    print("✅ SCRIPT 06 COMPLETE")
+    print("=" * 80)
+    print(f"Hotspots: {n_hotspots:,} | Clusters: {n_valid_clusters}")
+    print(f"Mean subsidence: {mean_cluster:.3f} cm/yr {'✓' if (n_valid_clusters > 0 and mean_cluster <= 0) else '⚠️'}")
+    print(f"Output: {OUTPUT_DIR}")
+    print("=" * 80 + "\n")
 
 if __name__ == '__main__':
-    pass
+    parser = argparse.ArgumentParser(description='Advanced Clustering')
+    parser.add_argument('--threshold', type=float, default=-2.0,
+                       help='Hotspot threshold cm/yr (negative=subsidence)')
+    parser.add_argument('--radius', type=float, default=2.0,
+                       help='Search radius km')
+    parser.add_argument('--min-size', type=int, default=10,
+                       help='Min cluster size')
+    parser.add_argument('--k', type=int, default=250,
+                       help='Primary k-neighbors')
+    args = parser.parse_args()
+    
+    main(args.threshold, args.radius, args.min_size, args.k)

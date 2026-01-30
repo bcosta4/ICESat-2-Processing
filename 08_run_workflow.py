@@ -97,7 +97,7 @@ TEMPORAL_OPTIONS = {
 # CONFIGURATION
 # ============================================================================
 
-BASE_OUTPUT_DIR = Path(r'E:\Processing\ICeSat-2\output_data')
+BASEOUTPUTDIR = Path(r'E:\Processing\ICeSat-2\output_data')
 
 # Define ALL scripts in execution order
 # Format: (script_num, script_name, description, args, is_required)
@@ -237,13 +237,13 @@ else:
 # SAVE EXECUTION LOG
 # ============================================================================
 
-timestamp_file = BASE_OUTPUT_DIR / 'latest_run_timestamp.txt'
+timestamp_file = BASEOUTPUTDIR / 'latest_RUN_TIMESTAMP.txt'
 
 if timestamp_file.exists():
     with open(timestamp_file, 'r') as f:
         run_id = f.read().strip()
 
-    log_dir = BASE_OUTPUT_DIR / f'run_{run_id}'
+    log_dir = BASEOUTPUTDIR / f'run_{run_id}'
     log_file = log_dir / f'execution_log_{run_id}.txt'
 
     try:

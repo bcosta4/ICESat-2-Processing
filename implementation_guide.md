@@ -1,438 +1,595 @@
-# ICESat-2 Processing Workflow - Consolidated Implementation
+# ICESat-2 Workflow Improvement Implementation Guide
 
-## Option A Implementation Guide
-
-This document covers the consolidation of your 16-script ICESat-2 workflow into 9 consolidated scripts while maintaining full reproducibility and processing logic.
-
----
-
-## Generated Consolidated Scripts
-
-### 1. **00_setup_validation.py**
-**Consolidates:** 00_check_packages.py + 00_validate_scripts.py
-
-**Purpose:** Prerequisites and environment validation
-
-**Functions:**
-- Check all required Python packages
-- Validate script syntax and structure
-- Verify configuration paths
-- Create output directory structure
-
-**Input:** System environment
-**Output:** `latest_run_timestamp.txt` (for other scripts)
+**Date**: January 16, 2026  
+**Status**: Critical fixes - implement before publication  
+**Priority**: Immediate (Tier 1: Required for scientific validity)
 
 ---
 
-### 2. **01_filter_photons.py**
-**Original:** 01_filter_photons.py (no consolidation)
+## Executive Summary
 
-**Purpose:** Raw ICESat-2 photon filtering
+This guide provides step-by-step instructions to implement **6 critical improvements** to the ICESat-2 permafrost subsidence analysis workflow. These fixes address:
 
-**Functions:**
-- Load PhoREAL CSV/LAS files
-- Filter for strong beams only
-- Confidence threshold filtering
-- Quality parameter validation
-- Auto-increment output directories
+1. **Sign convention errors** (Scripts 04, 06) - affecting all spatial statistics
+2. **Temporal calculation inflation** (Script 03) - rates inflated 24-50×
+3. **Insufficient outlier filtering** (Scripts 01-03) - extreme values persisting
+4. **Figure generation errors** (Script 07) - dimension and colormap issues
+5. **Metadata incompleteness** (All scripts) - reproducibility gaps
 
-**Input:** Raw ATL03 files (CSV or LAS format)
-**Output:** `icesat2_filtered_ground_photons.csv`
-
----
-
-### 3. **01b_filter_terrain.py**
-**Consolidates:** 01b_filter_land_lakes_ocean.py (renamed for clarity)
-
-**Purpose:** Land/water/lakes classification
-
-**Functions:**
-- Load Canadian government boundary layers
-- Separate photons into land/ocean/lakes
-- Spatial join operations
-- Three-way classification
-
-**Input:** `icesat2_filtered_ground_photons.csv`
-**Output:** 
-- `icesat2_filtered_ground_photons_LAND.csv`
-- `icesat2_filtered_ground_photons_OCEAN.csv`
-- `icesat2_filtered_ground_photons_LAKES.csv`
+**Expected outcomes**:
+- Subsidence rates: -1063 mm/yr → **-20 to -50 mm/yr** ✓
+- Spatial maps: all red (uplift) → **blue (subsidence) dominant** ✓
+- RMSE ratio: 4.067 → **< 2.0** ✓
+- Figures: dimension warnings → **clean generation** ✓
 
 ---
 
-### 4. **02_analysis_core.py**
-**Consolidates:** 02_crossover_analysis.py + 03_insar_integration.py
+## Implementation Timeline
 
-**Purpose:** Core crossover detection and InSAR integration
-
-**Functions:**
-
-**Section 1: Crossover Analysis**
-- Optimized cKDTree-based spatial matching
-- Temporal filtering with multiple options
-- 3-sigma outlier removal
-- Rate calculation and validation
-
-**Section 2: InSAR Integration**
-- Load InSAR GeoTIFF rasters
-- Reproject to match ICESat-2 CRS
-- Sample InSAR values at ICeSat-2 locations
-- Compute validation metrics (correlation, RMSE)
-
-**Input:** `icesat2_filtered_ground_photons_LAND.csv`
-**Output:**
-- `icesat2_repeat_track_matches.csv`
-- `icesat2_insar_integrated.csv`
-- `insar_integration_summary.txt`
+| Phase | Duration | Tasks | Scripts |
+|-------|----------|-------|---------|
+| **Phase 1** | 1 week | Fix temporal calculation, fix sign convention | 03, 04, 06 |
+| **Phase 2** | 2-3 weeks | Multi-tier outlier filtering | 01, 02, 03 |
+| **Phase 3** | 1 week | Enhanced visualizations, metadata | 05, 07 |
+| **Phase 4** | 1 week | Testing, validation, documentation | All |
 
 ---
 
-### 5. **03_analysis_spatial.py**
-**Consolidates:** 04_visualization.py + 05_coverage_analysis.py
+## Phase 1: Critical Sign Convention & Temporal Fixes (1 week)
 
-**Purpose:** Spatial distribution and visualization
+### Task 1.1: Fix Temporal Calculation in Script 03 (1-2 hours)
 
-**Functions:**
+**File**: `03_analysis_core.py`
 
-**Section 1: Visualization**
-- Summary statistics plots
-- Height change distribution
-- Rate distribution histograms
-- Geographic scatter plots
-- Uncertainty analysis
-
-**Section 2: Coverage Analysis**
-- Grid-based spatial analysis
-- Coverage statistics
-- Track-based breakdown
-- Data gap identification
-
-**Input:** `icesat2_repeat_track_matches.csv`
-**Output:**
-- `icesat2_summary_plots.png`
-- `spatial_coverage_grid.csv`
-- `coverage_analysis_summary.txt`
-
----
-
-### 6. **04_analysis_temporal.py**
-**Consolidates:** 06_interannual_subsidence_analysis.py + 07_multiscale_analysis.py
-
-**Purpose:** Temporal patterns and multi-scale analysis
-
-**Functions:**
-
-**Section 1: Interannual Subsidence**
-- Temporal classification (stable/subsiding/rising)
-- Time interval analysis
-- Regional subsidence identification
-- Classification report generation
-
-**Section 2: Multi-Scale Analysis**
-- Local scale (500m) patterns
-- Regional scale (5km) patterns
-- Watershed scale (50km) patterns
-- Spatial aggregation and statistics
-
-**Input:** `icesat2_repeat_track_matches.csv`
-**Output:**
-- `icesat2_classified_subsidence.csv`
-- `spatial_aggregation_local_500m.csv`
-- `spatial_aggregation_regional_5000m.csv`
-- `spatial_aggregation_watershed_50000m.csv`
-
----
-
-### 7. **05_analysis_advanced.py**
-**Original:** 08_AroundPT_clustering.py (no consolidation)
-
-**Purpose:** Spatial density clustering and continuous distribution
-
-**Functions:**
-- C-optimized neighbor search with cKDTree
-- Continuous density metrics (neighbor counts)
-- Correlation with subsidence rates
-- Density distribution analysis
-
-**Input:** `icesat2_repeat_track_matches.csv`
-**Output:**
-- `density_clusters_all.csv`
-- `density_distribution_analysis.txt`
-- `density_vs_rate.csv`
-
----
-
-### 8. **06_output_generation.py**
-**Consolidates:** 09_publication_figures.py + 10_validation_diagnostics.py + 11_export_to_gis.py
-
-**Purpose:** Final output generation and quality assurance
-
-**Functions:**
-
-**Section 1: Publication Figures (Script 09)**
-- Subsidence map with basemap
-- Measurement density map
-- Gridded subsidence map
-- Statistical distributions
-- Spatial density heatmaps
-- Multi-panel comparison figures
-
-**Section 2: Validation Diagnostics (Script 10)**
-- InSAR cross-validation scatter plots
-- Density stratification analysis
-- Robust statistics validation
-- Comprehensive validation framework
-
-**Section 3: GIS Export (Script 11)**
-- Export to Shapefile format
-- Export to GeoPackage format
-- Create combined GeoPackage with metadata
-- Generate GIS metadata documentation
-
-**Input:** 
-- `density_clusters_all.csv`
-- `icesat2_insar_integrated.csv`
-
-**Output:**
-- `01_subsidence_map_with_basemap.png` (300 DPI)
-- `02_measurement_density_map.png`
-- `03_subsidence_map_gridded.png`
-- `04_statistics_distributions.png`
-- ... (8 publication figures total)
-- `validation_insar_scatter.png`
-- `validation_density_stratification.png`
-- `icesat2_crossovers.shp` + supporting files
-- `icesat2_analysis_combined.gpkg`
-
----
-
-### 9. **07_run_workflow.py**
-**Consolidates:** 11_run_all.py + 12_run_partial.py
-
-**Purpose:** Flexible workflow orchestration
-
-**Functions:**
-- Run all scripts sequentially
-- Partial execution with resume capability
-- Error handling and logging
-- Execution summary and reporting
-- Timing information for each step
-
-**Input:** Configuration settings
-**Output:** `processing_log_{RUN_ID}.txt`
-
----
-
-## File Dependencies and Data Flow
-
-```
-00_setup_validation.py
-    ↓
-01_filter_photons.py
-    ↓
-01b_filter_terrain.py
-    ↓
-02_analysis_core.py
-    ├→ icesat2_repeat_track_matches.csv
-    └→ icesat2_insar_integrated.csv
-    ↓
-03_analysis_spatial.py
-    ↓
-04_analysis_temporal.py
-    ↓
-05_analysis_advanced.py
-    ↓
-06_output_generation.py
-    ↓
-07_run_workflow.py (orchestrates everything)
-```
-
----
-
-## Environment Variables & Configuration
-
-All scripts read from these shared configuration locations:
-
+**Problem**: 
 ```python
-BASE_OUTPUT_DIR = Path(r'E:\Processing\ICESat-2\output_data')
-RUN_TIMESTAMP = latest_run_timestamp.txt  # Auto-generated by Script 01
-OUTPUT_DIR = BASE_OUTPUT_DIR / f'run_{RUN_TIMESTAMP}'
+# WRONG: Uses fixed 15-day parameter
+rate_mm_yr = dH_m / (TEMPORAL_UNCERTAINTY_DAYS / 365.25) * 1000
+# Result: rates inflated by factor of (actual_days / 15)
 ```
 
-Each script automatically:
-1. Reads latest run timestamp
-2. Creates output folder if needed
-3. Loads input files from `OUTPUT_DIR`
-4. Saves results to `OUTPUT_DIR`
-5. Updates timestamp file for next scripts
+**Solution**: Use actual temporal separation between paired observations
 
----
+**Implementation**:
 
-## Running the Consolidated Workflow
+1. **Open** `03_analysis_core.py`
 
-### Full Execution
-```bash
-python 07_run_workflow.py
-```
+2. **Locate** the crossover pair calculation section (~line 300-400)
 
-### Individual Script Execution
-```bash
-python 00_setup_validation.py
-python 01_filter_photons.py
-python 01b_filter_terrain.py
-python 02_analysis_core.py
-python 03_analysis_spatial.py
-python 04_analysis_temporal.py
-python 05_analysis_advanced.py
-python 06_output_generation.py
-```
+3. **Find** where rate is calculated - typically in a loop processing pairs
 
-### Resume from Specific Point
-```bash
-# Edit 07_run_workflow.py to start from desired script:
-SCRIPTS = [
-    # Skip early scripts...
-    ('04', '04_analysis_temporal.py', 'Temporal analysis'),
-    # ... continue
-]
-```
-
----
-
-## Migration Checklist
-
-- [ ] Copy all 9 consolidated scripts to your scripts directory
-- [ ] Verify paths in each script match your system
-- [ ] Run `00_setup_validation.py` to verify environment
-- [ ] Run `01_filter_photons.py` with test data
-- [ ] Verify output files are created correctly
-- [ ] Update any documentation references to new script names
-- [ ] Create backup of original 16-script directory
-- [ ] Test full workflow with `07_run_workflow.py`
-- [ ] Verify outputs match expected formats
-- [ ] Update thesis methods section with new script names
-
----
-
-## Key Changes from Original
-
-### Imports & Dependencies
-- All required imports consolidated at top of each file
-- Removed duplicate imports across consolidated scripts
-- Added error handling for missing packages
-
-### Path Handling
-- Standardized to use `pathlib.Path` throughout
-- Consistent output directory structure
-- Auto-increment for multiple runs per day
-
-### Data Flow
-- All inter-script dependencies through CSV files
-- Timestamp file ensures correct run association
-- No hardcoded run IDs
-
-### Code Organization
-- Clear section headers showing original script boundaries
-- Original script numbers in section comments
-- Preserved all variable names and logic
-- No functional changes to algorithms
-
----
-
-## Detailed Consolidation Rationale
-
-### 02_analysis_core.py (Why combine crossover + InSAR?)
-- Crossover analysis produces matching points
-- InSAR integration immediately uses those matches
-- No intermediate user intervention needed
-- Both operate on same dataset
-- Validation metrics naturally follow crossover analysis
-
-### 03_analysis_spatial.py (Why combine visualization + coverage?)
-- Visualization creates diagnostic plots
-- Coverage analysis explains spatial patterns in those plots
-- Both are exploratory/diagnostic, not computational core
-- User often wants both before proceeding to analysis
-
-### 04_analysis_temporal.py (Why combine subsidence + multiscale?)
-- Subsidence classification identifies temporal patterns
-- Multiscale analysis examines those patterns at different scales
-- Both focus on temporal-spatial relationships
-- Natural progression: classify → aggregate → analyze
-
-### 06_output_generation.py (Why combine three outputs?)
-- All three produce final publication-ready outputs
-- No intermediate data exchange between them
-- Can run in any order
-- User typically generates all three for final paper
-
----
-
-## Reproducibility Verification
-
-Each consolidated script preserves:
-1. **All original code** - Line-for-line from original scripts
-2. **All variable names** - No renaming or refactoring
-3. **All data processing steps** - Exact order and logic
-4. **All outputs** - Same file names, formats, content
-5. **All error handling** - Original try-except blocks
-
-To verify: Compare output CSV files pixel-by-pixel with original workflow.
-
----
-
-## Performance Implications
-
-Consolidation provides **no performance changes**:
-- Same algorithms with same complexity
-- Same I/O patterns (read CSV → process → write CSV)
-- Slightly reduced Python startup overhead (8 fewer imports)
-- No computational optimization added
-
-If performance is critical, consider:
-1. Using `pandas.read_csv(..., chunksize=...)` for large files
-2. Implementing multiprocessing in spatial operations
-3. Using `numba.jit` for numerical bottlenecks
-
----
-
-## Future Maintenance
-
-When updating scripts:
-1. Find the relevant consolidated script (by number)
-2. Locate the section header marking original script
-3. Update only that section
-4. Do NOT refactor across consolidated sections
-5. Maintain original section boundaries for clarity
-
-Example:
+4. **Replace** the rate calculation with:
 ```python
-# ============================================================================
-# SECTION: 06_interannual_subsidence_analysis.py (Original Script 06)
-# ============================================================================
-# All code from Script 06 goes here - modify only this section
+# CRITICAL FIX: Use actual temporal separation, not fixed 15-day window
+dH_m = photons.iloc[j]['h'] - photons.iloc[i]['h']
+dt_days = abs((photons.iloc[j]['datetime'] - photons.iloc[i]['datetime']).days)
+
+# Correct formula uses ACTUAL days between observations
+dt_years = dt_days / 365.25
+rate_mm_yr = (dH_m / dt_years) * 1000.0
+
+# Save actual temporal separation for metadata
+crossover_pair = {
+    ...
+    'dt_days_actual': dt_days,  # NEW: Actual separation
+    'dt_years': dt_years,
+    'subsidence_rate_mm_per_year': rate_mm_yr,  # Correct rate
+    ...
+}
 ```
 
+5. **Update** metadata to include `dt_days_actual`
+
+6. **Add** verification logging:
+```python
+mean_rate = df_clean['subsidence_rate_mm_per_year'].mean()
+logger.info(f"Mean subsidence rate: {mean_rate:.2f} mm/yr")
+logger.info(f"Expected range: -20 to -50 mm/yr for Tuktoyaktuk permafrost")
+
+# Critical assertion
+assert -100 < mean_rate < 20, f"Rate {mean_rate} outside expected range!"
+```
+
+**Verification**:
+- ✓ Log shows mean rate in range -50 to -20 mm/yr
+- ✓ No assertion error
+- ✓ Output file includes `dt_days_actual` column
+
 ---
 
-## Support & Troubleshooting
+### Task 1.2: Fix Sign Convention in Script 04 (30 minutes)
 
-If a consolidated script fails:
+**File**: `04_analysis_spatial.py`
 
-1. **Identify which original script failed** - Check output and section headers
-2. **Review that script's section** - All original code is preserved
-3. **Check dependencies** - Verify input CSV files exist
-4. **Review column names** - May vary between versions (handled with fallbacks)
-5. **Check file paths** - Ensure external data (GIS files, GeoTIFFs) are accessible
+**Problem**: Column detection picks `rate_uncertainty_mm_yr` instead of subsidence rate
 
-Original script numbers are always shown in comments for reference.
+**Solution**: Implement priority-based column detection
+
+**Implementation**:
+
+1. **Open** `04_analysis_spatial.py`
+
+2. **Locate** column detection section (~line 200-220):
+```python
+# WRONG: Picks first 'rate' match
+for col in df.columns:
+    if 'rate' in col.lower():
+        rate_col = col  # Could be uncertainty!
+```
+
+3. **Replace** with prioritized detection:
+```python
+# Priority 1: Explicit subsidence rate column
+rate_col = None
+for col in df.columns:
+    if col.lower() == 'subsidence_rate_mm_per_year':
+        rate_col = col
+        break
+
+# Priority 2: Any subsidence column
+if rate_col is None:
+    for col in df.columns:
+        if 'subsidence' in col.lower() and 'rate' in col.lower():
+            rate_col = col
+            break
+
+# Priority 3: Generic rate (but not uncertainty!)
+if rate_col is None:
+    for col in df.columns:
+        if 'rate' in col.lower() and 'uncertainty' not in col.lower():
+            rate_col = col
+            break
+
+# Validate detection
+assert rate_col is not None, "Cannot find rate column!"
+logger.info(f"Using rate column: {rate_col}")
+```
+
+4. **Add sign convention verification**:
+```python
+# Verify sign convention
+mean_rate = df[rate_col].mean()
+negative_count = (df[rate_col] < 0).sum()
+negative_pct = 100.0 * negative_count / len(df)
+
+logger.info(f"Sign verification:")
+logger.info(f"  Mean rate: {mean_rate:.2f} mm/yr")
+logger.info(f"  Negative (subsidence): {negative_count:,} ({negative_pct:.1f}%)")
+logger.info(f"  Positive (uplift): {(df[rate_col] > 0).sum():,}")
+
+assert negative_count > 0, "No subsidence values found!"
+assert negative_pct > 20, f"Only {negative_pct:.1f}% show subsidence!"
+```
+
+5. **Fix dimension validation** (around line 280):
+```python
+# Validate coordinate ranges
+lon_min, lat_min = coords.min(axis=0)
+lon_max, lat_max = coords.max(axis=0)
+
+assert lon_max > lon_min, f"Invalid lon range: {lon_min} to {lon_max}"
+assert lat_max > lat_min, f"Invalid lat range: {lat_min} to {lat_max}"
+
+logger.info(f"Grid extent: lon {lon_min:.4f}°-{lon_max:.4f}°, lat {lat_min:.4f}°-{lat_max:.4f}°")
+```
+
+**Verification**:
+- ✓ Log shows correct rate column name
+- ✓ Log shows >50% negative values
+- ✓ No assertion errors
+- ✓ Grid dimensions printed without errors
 
 ---
 
-## Contact & Questions
+### Task 1.3: Fix Sign Convention in Script 06 (30 minutes)
 
-For questions about specific consolidation decisions, refer to the consolidation plan document which includes:
-- Detailed rationale for each merge
-- Alternative consolidation options (Options B & C)
-- Risk assessment for each grouping
-- Implementation timeline
+**File**: `06_analysis_advanced.py`
+
+**Same procedure as Script 04**, but with additional hotspot threshold check:
+
+1. **Apply same column detection** as Task 1.2
+
+2. **Fix hotspot identification** (~line 280):
+```python
+# OLD (WRONG - picks uplift as hotspots)
+hotspot_mask = subsidence_rates >= SUBSIDENCE_THRESHOLD_MM_YR  # ✗ Wrong sign!
+
+# NEW (CORRECT - for negative threshold, use <=)
+# Note: SUBSIDENCE_THRESHOLD_MM_YR should be NEGATIVE (e.g., -20.0)
+hotspot_mask = subsidence_rates <= SUBSIDENCE_THRESHOLD_MM_YR  # ✓ Correct
+
+logger.info(f"Hotspot threshold: subsidence >= {abs(SUBSIDENCE_THRESHOLD_MM_YR)} mm/yr")
+logger.info(f"(Represented as <= {SUBSIDENCE_THRESHOLD_MM_YR} in negative convention)")
+```
+
+3. **Verify cluster statistics are negative**:
+```python
+if len(df_cluster_stats) > 0:
+    mean_cluster = df_cluster_stats['mean_subsidence'].mean()
+    logger.info(f"Cluster mean subsidence: {mean_cluster:.2f} mm/yr")
+    
+    if mean_cluster > 0:
+        logger.warning(f"WARNING: Cluster mean is positive - may indicate wrong column!")
+        logger.warning(f"Column used: {rate_col}")
+```
+
+**Verification**:
+- ✓ Log shows correct hotspot threshold interpretation
+- ✓ Cluster statistics show NEGATIVE means
+- ✓ No positive uplift clusters
+
+---
+
+## Phase 2: Multi-Tier Outlier Filtering (2-3 weeks)
+
+### Task 2.1: Enhance Script 03 Outlier Filtering (1-2 weeks)
+
+**File**: `03_analysis_core.py`
+
+**Problem**: Current 3-sigma filtering leaves ±80 m/yr extremes; RMSE ratio = 4.067
+
+**Solution**: Implement multi-tier approach (Nature 2024 methodology)
+
+**Implementation**:
+
+1. **Add multi-tier filtering function** to Script 03:
+```python
+def filter_outliers_multitier(df, rate_col, config, logger=None):
+    """
+    Multi-tier outlier filtering:
+    Tier 1: Physical plausibility
+    Tier 2: Progressive sigma (5σ → 3σ → 2σ)
+    """
+    
+    initial_count = len(df)
+    logger.info(f"Starting multi-tier filtering with {initial_count:,} points")
+    
+    # TIER 1: Physical plausibility
+    logger.info("TIER 1: Physical plausibility filtering...")
+    
+    physical_filter = (
+        (np.abs(df[rate_col]) < config.RATE_PHYSICAL_MAX_MM_YR) &
+        (df['dH_m'] < config.DH_PHYSICAL_MAX_M)
+    )
+    df = df[physical_filter].copy()
+    tier1_removed = initial_count - len(df)
+    logger.info(f"  Removed {tier1_removed:,} physically implausible points")
+    
+    # TIER 2: Progressive sigma filtering
+    logger.info("TIER 2: Progressive sigma filtering...")
+    
+    for sigma_level in [5.0, 3.0, 2.0]:
+        mean_rate = df[rate_col].mean()
+        std_rate = df[rate_col].std()
+        
+        sigma_filter = np.abs(df[rate_col] - mean_rate) < sigma_level * std_rate
+        removed = (~sigma_filter).sum()
+        df = df[sigma_filter].copy()
+        
+        logger.info(f"  σ={sigma_level}: Removed {removed:,}, remaining {len(df):,}")
+    
+    return df, {
+        'initial': initial_count,
+        'tier1_removed': tier1_removed,
+        'final': len(df),
+        'removal_pct': 100 * (initial_count - len(df)) / initial_count,
+    }
+```
+
+2. **Add configuration parameters** to Config class:
+```python
+class Config:
+    # ... existing parameters ...
+    
+    # TIER 1: Physical plausibility limits
+    RATE_PHYSICAL_MAX_MM_YR = 200.0  # Absolute max subsidence
+    DH_PHYSICAL_MAX_M = 2.0          # Max elevation change per pair
+    
+    # TIER 2: Progressive sigma filtering
+    OUTLIER_SIGMA_TIERS = [5.0, 3.0, 2.0]
+```
+
+3. **Apply filtering** in main execution:
+```python
+logger.info("Applying multi-tier outlier filtering...")
+df_clean, filter_stats = filter_outliers_multitier(
+    df_pairs,
+    'subsidence_rate_mm_per_year',
+    config,
+    logger
+)
+
+metadata.filtering_statistics = filter_stats
+logger.info(f"Filtered results: {filter_stats['final']:,} points ({filter_stats['removal_pct']:.1f}% removed)")
+```
+
+**Verification**:
+- ✓ Log shows tier-by-tier removal statistics
+- ✓ RMSE ratio < 2.0
+- ✓ No ±80 m/yr extremes remain
+- ✓ Filtering statistics in metadata
+
+---
+
+### Task 2.2: Add Quality Filtering to Scripts 01 & 02 (1 week)
+
+**Files**: `01_filter_photons.py`, `02_filter_terrain.py`
+
+**Problem**: Poor quality photons retained, causing outliers downstream
+
+**Solution**: Add ATL03 quality metrics filtering
+
+**Implementation for Script 01**:
+
+1. **Locate** photon quality filtering section
+
+2. **Add quality checks**:
+```python
+# Apply quality filters (ATL03 standards)
+logger.info("Applying ATL03 quality filters...")
+
+quality_filters = (
+    # Signal confidence (0-4, higher is better)
+    (photons['signal_conf_ph'] >= 3) &  # Medium-high confidence
+    # Quality flag (0 = good)
+    (photons['quality_ph'] == 0) &
+    # Elevation plausibility (compared to reference DEM)
+    (np.abs(photons['h_ph'] - reference_dem_height) < 10)  # Within 10m of DEM
+)
+
+photons = photons[quality_filters].copy()
+logger.info(f"After quality filtering: {len(photons):,} photons")
+
+# Track removal statistics
+metadata.filtering_statistics['quality_filters_removed'] = (
+    len(photons) - quality_filters.sum()
+)
+```
+
+**Implementation for Script 02**:
+
+Similar approach - add confidence and DEM consistency checks
+
+---
+
+## Phase 3: Enhanced Visualizations (1 week)
+
+### Task 3.1: Fix Figures in Script 07 (1 week)
+
+**File**: `07_output_generation.py`
+
+**Problem**: Dimension errors, no diverging colormap, uniform red maps
+
+**Solution**: Implement dimension validation and TwoSlopeNorm
+
+**Implementation**:
+
+1. **Add imports**:
+```python
+from matplotlib.colors import TwoSlopeNorm, BoundaryNorm
+import matplotlib.pyplot as plt
+```
+
+2. **Create spatial contour function**:
+```python
+def create_spatial_contour_map_fixed(spatial_grid, output_dir, logger=None):
+    """Generate contour map with proper dimension handling and diverging colormap"""
+    
+    # Validate data
+    if len(spatial_grid) == 0 or 'rate_mm_yr' not in spatial_grid.columns:
+        logger.warning("Insufficient data for contour maps")
+        return None
+    
+    # Create pivot table with dimension checks
+    pivot = spatial_grid.pivot_table(
+        values='rate_mm_yr',
+        index='latitude',
+        columns='longitude',
+        aggfunc='mean'
+    )
+    
+    if pivot.empty or pivot.shape[0] < 2 or pivot.shape[1] < 2:
+        logger.warning("Pivot table has insufficient dimensions")
+        return None
+    
+    # Get rate statistics
+    rate_min = spatial_grid['rate_mm_yr'].quantile(0.05)
+    rate_max = spatial_grid['rate_mm_yr'].quantile(0.95)
+    
+    # Create figure with TwoSlopeNorm
+    fig, ax = plt.subplots(figsize=(12, 8))
+    
+    norm = TwoSlopeNorm(vmin=rate_min, vcenter=0, vmax=rate_max)
+    
+    cs = ax.contourf(
+        pivot.columns, pivot.index, pivot.values,
+        levels=20,
+        cmap='RdBu_r',  # Blue=subsidence, Red=uplift
+        norm=norm
+    )
+    
+    cbar = plt.colorbar(cs, ax=ax, extend='both')
+    cbar.set_label('Subsidence Rate (mm/yr)', fontsize=11)
+    
+    ax.set_xlabel('Longitude (°W)', fontsize=11)
+    ax.set_ylabel('Latitude (°N)', fontsize=11)
+    ax.set_title('Permafrost Subsidence Distribution (Blue=Subsidence, Red=Uplift)',
+                fontsize=12, fontweight='bold')
+    
+    # Save
+    fig.savefig(
+        output_dir / '07_Figure_Spatial_Contours.png',
+        dpi=300, bbox_inches='tight'
+    )
+    plt.close()
+    
+    return fig
+```
+
+3. **Create 4-panel figure**:
+```python
+# Use the comprehensive function from 07_visualization_FIXES.py
+create_enhanced_multipanel_figure(spatial_grid, clusters_df, output_dir, logger)
+```
+
+4. **Replace old figure calls**:
+```python
+# OLD (remove these)
+# create_spatial_contour_map_fig04(...)
+# create_hotspot_multipanel_fig06(...)
+
+# NEW (replace with)
+create_spatial_contour_map_fixed(spatial_grid, output_dir, logger)
+create_enhanced_multipanel_figure(spatial_grid, clusters_df, output_dir, logger)
+```
+
+**Verification**:
+- ✓ No dimension error messages
+- ✓ Figures generated successfully
+- ✓ Spatial maps show BLUE (subsidence) dominant
+- ✓ Color scale symmetric around 0
+
+---
+
+## Phase 4: Testing & Validation (1 week)
+
+### Verification Checklist
+
+Run through each verification step to confirm fixes:
+
+```markdown
+## Sign Convention Verification
+
+- [ ] Script 03: Log shows "subsidence_rate_mm_per_year" column detected
+- [ ] Script 03: Log shows mean rate in range -50 to -20 mm/yr
+- [ ] Script 03: Log shows >50% negative values
+- [ ] Script 04: Log shows correct rate column name
+- [ ] Script 04: Log shows grid extent (lon/lat ranges)
+- [ ] Script 04: Output spatial_statistics.csv has negative mean values
+- [ ] Script 06: Log shows hotspot threshold interpretation (>=XX mm/yr subsidence)
+- [ ] Script 06: Cluster statistics show NEGATIVE mean subsidence
+- [ ] Script 07: Figures generate without dimension warnings
+- [ ] Script 07: Spatial maps show BLUE (subsidence) and RED (uplift) zones
+
+## Temporal Calculation Verification
+
+- [ ] Script 03: Column 'dt_days_actual' in output CSV
+- [ ] Script 03: Subsidence rate values reasonable (not inflated)
+- [ ] Script 03: Log confirms "TEMPORAL CALCULATION FIXED"
+- [ ] Metadata includes filtering statistics
+
+## Outlier Filtering Verification
+
+- [ ] Script 03: Log shows tier-by-tier filtering results
+- [ ] Script 03: RMSE ratio < 2.0
+- [ ] Script 03: No extreme outliers (±80 m/yr) remain
+- [ ] Script 01/02: Quality filters applied
+- [ ] Script 01/02: Log shows photons removed by quality
+
+## Figure Generation Verification
+
+- [ ] Script 07: No dimension error messages
+- [ ] Script 07: All figures generated successfully
+- [ ] Spatial contours show correct subsidence/uplift distinction
+- [ ] 4-panel figure includes all panels
+- [ ] Color scales are sensible (symmetric around 0)
+
+## Metadata Verification
+
+- [ ] All metadata files include filtering statistics
+- [ ] Temporal metadata includes dt_days_actual
+- [ ] Column names logged in all spatial scripts
+- [ ] Git hashes recorded for reproducibility
+```
+
+### Test Run Procedure
+
+1. **Run Script 03**:
+```bash
+python 03_analysis_core.py --temporal 2
+```
+Expected output:
+- Mean rate: -25 to -45 mm/yr
+- dt_days_actual column in output
+- TEMPORAL CALCULATION FIXED confirmation
+
+2. **Run Script 04**:
+```bash
+python 04_analysis_spatial.py
+```
+Expected output:
+- Correct rate column detected
+- >50% negative values verified
+- No dimension warnings
+
+3. **Run Script 06**:
+```bash
+python 06_analysis_advanced.py
+```
+Expected output:
+- Correct rate column detected
+- Cluster mean subsidence NEGATIVE
+- Hotspot threshold correctly interpreted
+
+4. **Run Script 07**:
+```bash
+python 07_output_generation.py
+```
+Expected output:
+- All figures generated
+- No dimension errors
+- Spatial maps show blue/red distinction
+
+---
+
+## Quick Reference: Key File Changes
+
+| Script | File | Changes | Priority |
+|--------|------|---------|----------|
+| 03 | analysis_core.py | Temporal calc, multi-tier filtering | **CRITICAL** |
+| 04 | analysis_spatial.py | Column detection, dimension validation | **CRITICAL** |
+| 06 | analysis_advanced.py | Column detection, hotspot threshold | **CRITICAL** |
+| 07 | output_generation.py | Dimension validation, TwoSlopeNorm | **HIGH** |
+| 01 | filter_photons.py | Quality metrics filtering | **HIGH** |
+| 02 | filter_terrain.py | Quality metrics filtering | **HIGH** |
+| 05 | analysis_temporal.py | Update metadata | **MEDIUM** |
+
+---
+
+## Support Files
+
+The following support files have been created:
+
+- **03_analysis_core_FIXED.py** - Complete fixed version (copy code)
+- **04_analysis_spatial_COLUMN_FIX.py** - Detailed patch instructions
+- **06_analysis_advanced_COLUMN_FIX.py** - Detailed patch instructions
+- **07_visualization_FIXES.py** - Complete visualization functions
+- **IMPLEMENTATION_PLAN.md** - Overview of all issues
+
+---
+
+## Questions & Troubleshooting
+
+**Q: How do I know if the sign convention is fixed?**  
+A: After running Script 04, check the output log for "Negative values (subsidence): X% (should be >50%)". Also verify spatial maps show BLUE zones.
+
+**Q: What if temporal calculation shows strange rates?**  
+A: Check Script 03 log for "TEMPORAL CALCULATION FIXED" message. Verify output CSV has 'dt_days_actual' column with actual time separations.
+
+**Q: Figures still showing all red?**  
+A: Check Script 04 log for detected rate column. If it shows "rate_uncertainty_mm_yr", the column detection fix didn't apply correctly.
+
+**Q: How do I revert if something breaks?**  
+A: Keep backups of original scripts. Changes are isolated to specific functions, so you can revert individual changes if needed.
+
+---
+
+## Next Steps After Implementation
+
+1. **Document changes** in workflow README with version notes
+2. **Update methodology section** of thesis/paper with correct rate calculations
+3. **Regenerate all figures** using fixed scripts
+4. **Recalculate statistics** for publication
+5. **Archive complete run** with metadata for reproducibility
+6. **Update supplementary materials** with corrected data/figures
+

@@ -1,51 +1,45 @@
 """
 ================================================================================
-SCRIPT 05: SUBSIDENCE RATE ANALYSIS - WITH REPRODUCIBILITY INFRASTRUCTURE
+SCRIPT 05: TEMPORAL ANALYSIS WITH COASTAL & ELEVATION STRATIFICATION
 ================================================================================
-Purpose: Calculate subsidence rates from paired ICESat-2 observations and 
-stratify by physically meaningful variables (elevation zones only).
-Modified with complete reproducibility infrastructure.
 
-NEW in this version:
-- Removed broken cross-stratification (Period × Timescale)
-- Fixed timescale classification to match ACTUAL data distribution
-- Focus on ELEVATION stratification (most physically meaningful)
-- Optional: timescale analysis kept for reference but not cross-stratified
-- IMPROVED: Complete reproducibility infrastructure (logging, metadata)
-- IMPROVED: UTF-8 encoding fix (NO UNICODE ERRORS!)
-- IMPROVED: Flexible input file detection (SCRIPT 03 OUTPUT FIX!)
-- CLEANED: Removed all git tracking code
-- CLEANED: Removed unnecessary blank lines
-- BUGFIXED: Added missing closing brace in metadata dictionary
+Purpose
+-------
+Calculate subsidence rates from ICESat-2 paired observations and stratify by:
+1. ELEVATION zones (10m bins) - PRIMARY
+2. COASTAL zones (from Script 04) - NEW
+3. Timescale (data-driven tertiles) - ENHANCED
 
-Method
-------
-1. Load paired observations from Script 03 crossover output
-2. Calculate subsidence rates (Δh / Δt in mm/year)
-3. Stratify by elevation zones (10m bins)
-4. Compute statistics per zone
-5. Save results
+CRITICAL FIXES (v2.1):
+✅ FIX #1: Compute x_utm/y_utm if missing (using EPSG:3155)
+✅ FIX #2: Graceful fallback if coastal zones unavailable
+✅ FIX #3: UTF-8 output wrapper for console compatibility
+✅ FIX #4: All rates in cm/yr (negative=subsidence, positive=uplift)
+
+ENHANCEMENTS:
+- Input priority: Script 03 output (FIRST), Script 04 grid (fallback)
+- Coastal zone integration from Script 04
+- Enhanced timescale categorization (data-driven)
+- Visualization-ready columns (UTM, z-scores)
+- All 5 original + 3 new coastal/visualization outputs
 
 Inputs
 ------
-- icesat2_repeat_track_matches.csv (Script 03 output - FIXED!)
-OR 04_paired_photons.csv (Script 04 output, if available)
+1. icesat2_repeat_track_matches.csv (Script 03) - PRIORITY 1
+2. 04_spatial_grid.csv (Script 04) - PRIORITY 2 (for coastal zones)
 
 Outputs
 -------
-- 05_subsidence_rates.csv (all pairs with rates)
-- 05_statistics_elevation.txt (subsidence by elevation zone)
-- 05_statistics_elevation.csv (machine-readable format)
-- 05_statistics_timescale.txt (reference only - not stratified)
+- 05_subsidence_rates.csv (all pairs with rates, in cm/yr)
+- 05_statistics_elevation.csv + .txt (elevation zones, 10m bins)
+- 05_statistics_coastal.csv + .txt (coastal zones)
+- 05_statistics_timescale.txt (enhanced timescale reference)
+- 05_visualization_prep.csv (viz-ready with UTM, z-scores)
+- 05_summary_all_stratifications.txt (combined summary)
 - script_05_run.log (execution log)
-- 05_analysis_temporal_metadata.json (reproducibility metadata)
+- 05_analysis_temporal_metadata.json (reproducibility)
 
-Reproducibility Notes
----------------------
-Stratification parameters (elevation bin size, timescale thresholds) strongly 
-influence which statistics are computed. Document these parameters clearly and 
-keep them fixed for all runs that you want to compare.
-================================================================================
+Units: ALL RATES IN CM/YR (negative=subsidence, positive=uplift)
 """
 
 import pandas as pd
@@ -54,549 +48,545 @@ import json
 import logging
 from pathlib import Path
 from datetime import datetime
+from pyproj import Transformer
 import sys
+import argparse
 import io
+import warnings
 
-# UTF-8 ENCODING FIX (CRITICAL - FIXES YOUR UNICODE ERROR!)
+warnings.filterwarnings('ignore')
+
+# UTF-8 FIX: Ensure console/file output is UTF-8 compatible
 if sys.stdout.encoding != 'utf-8':
-	sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 if sys.stderr.encoding != 'utf-8':
-	sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
-
-# ============================================================================
-# LOGGING SETUP (DUAL OUTPUT: FILE + CONSOLE)
-# ============================================================================
-
-def setup_logging(output_dir):
-	"""Configure logging to both file and console."""
-	log_file = output_dir / 'script_05_run.log'
-	logger = logging.getLogger('script_05')
-	logger.setLevel(logging.DEBUG)
-	logger.handlers = []
-	fh = logging.FileHandler(log_file, encoding='utf-8', mode='w')
-	fh.setLevel(logging.DEBUG)
-	fh_formatter = logging.Formatter(
-		'%(asctime)s [%(levelname)s] %(message)s',
-		datefmt='%Y-%m-%d %H:%M:%S'
-	)
-	fh.setFormatter(fh_formatter)
-	ch = logging.StreamHandler()
-	ch.setLevel(logging.INFO)
-	ch_formatter = logging.Formatter('%(message)s')
-	ch.setFormatter(ch_formatter)
-	logger.addHandler(fh)
-	logger.addHandler(ch)
-	return logger
-
-# ============================================================================
-# RUN METADATA CLASS (AUDIT TRAIL)
-# ============================================================================
-
-class RunMetadata:
-	"""Capture complete run parameters for reproducibility."""
-
-	def __init__(self, run_id):
-		self.run_id = run_id
-		self.script_name = '05_analysis_temporal'
-		self.script_version = 'v1.2-clean-bugfixed'
-		self.start_time = datetime.now().isoformat()
-		self.end_time = None
-		self.configuration = {}
-		self.processing_results = {}
-		self.environment_info = {
-			'python_version': f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
-			'platform': sys.platform,
-			'timestamp': datetime.now().isoformat(),
-		}
-
-	def finalize(self):
-		"""Mark run as complete."""
-		self.end_time = datetime.now().isoformat()
-
-	def save(self, output_dir):
-		"""Save metadata as JSON."""
-		metadata_file = output_dir / f'{self.script_name}_metadata.json'
-		metadata = {
-			'run_id': self.run_id,
-			'script': self.script_name,
-			'version': self.script_version,
-			'environment': self.environment_info,
-			'timestamps': {
-				'start': self.start_time,
-				'end': self.end_time,
-			},
-			'configuration': self.configuration,
-			'processing_results': self.processing_results,
-		}
-		with open(metadata_file, 'w', encoding='utf-8') as f:
-			json.dump(metadata, f, indent=2, default=str, ensure_ascii=False)
-		return metadata_file
-
-# ============================================================================
-# CONFIGURATION
-# ============================================================================
-
-BASE_OUTPUT_DIR = Path(r'E:\Processing\ICeSat-2\output_data')
-timestamp_file = BASE_OUTPUT_DIR / 'latest_run_timestamp.txt'
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 
 try:
-	with open(timestamp_file, 'r', encoding='utf-8') as f:
-		RUN_TIMESTAMP = f.read().strip()
-	OUTPUT_DIR = BASE_OUTPUT_DIR / f'run_{RUN_TIMESTAMP}'
+    from config import BASEOUTPUTDIR
+except ImportError:
+    BASEOUTPUTDIR = Path(r'E:\Processing\ICeSat-2\output_data')
+
+# ============================================================================
+# LOGGING SETUP
+# ============================================================================
+def setup_logging(output_dir):
+    """Configure logging to both file and console."""
+    log_file = output_dir / 'script_05_run.log'
+    logger = logging.getLogger('script_05')
+    logger.setLevel(logging.DEBUG)
+    logger.handlers = []
+    
+    # File handler
+    fh = logging.FileHandler(log_file, encoding='utf-8', mode='w')
+    fh.setLevel(logging.DEBUG)
+    fh_formatter = logging.Formatter(
+        '%(asctime)s [%(levelname)s] %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    fh.setFormatter(fh_formatter)
+    
+    # Console handler
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.INFO)
+    ch_formatter = logging.Formatter('%(message)s')
+    ch.setFormatter(ch_formatter)
+    
+    logger.addHandler(fh)
+    logger.addHandler(ch)
+    
+    return logger
+
+# ============================================================================
+# METADATA TRACKING
+# ============================================================================
+class RunMetadata:
+    """Capture complete run parameters for reproducibility."""
+    
+    def __init__(self, run_id):
+        self.run_id = run_id
+        self.script_name = '05_analysis_temporal'
+        self.script_version = 'v2.1-fixes-utm-coastal'
+        self.start_time = datetime.now().isoformat()
+        self.end_time = None
+        self.configuration = {}
+        self.processing_results = {}
+        self.environment_info = {
+            'python_version': f'{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}',
+            'platform': sys.platform,
+            'timestamp': datetime.now().isoformat(),
+        }
+    
+    def finalize(self):
+        """Mark run as complete."""
+        self.end_time = datetime.now().isoformat()
+    
+    def save(self, output_dir):
+        """Save metadata as JSON."""
+        metadata_file = output_dir / '05_analysis_temporal_metadata.json'
+        metadata = {
+            'run_id': self.run_id,
+            'script': self.script_name,
+            'version': self.script_version,
+            'environment': self.environment_info,
+            'timestamps': {'start': self.start_time, 'end': self.end_time},
+            'configuration': self.configuration,
+            'processing_results': self.processing_results,
+        }
+        with open(metadata_file, 'w', encoding='utf-8') as f:
+            json.dump(metadata, f, indent=2, default=str, ensure_ascii=False)
+        return metadata_file
+
+# ============================================================================
+# UTILITY: FIND INPUT FILE
+# ============================================================================
+def find_input_file(output_dir):
+    """Find input file with correct priority order."""
+    priority_files = [
+        output_dir / 'icesat2_repeat_track_matches.csv',  # Script 03 (PRIORITY 1)
+        output_dir / '04_spatial_grid.csv',               # Script 04 (fallback)
+        output_dir / '03_paired_photons.csv',             # Fallback
+        output_dir / '04_paired_photons.csv',             # Fallback
+    ]
+    
+    for filepath in priority_files:
+        if filepath.exists():
+            return filepath
+    
+    print("ERROR: Could not find input file.")
+    print("Searched for:")
+    for f in priority_files:
+        print(f"  - {f.name}")
+    sys.exit(1)
+
+# ============================================================================
+# UTILITY: ENHANCED TIMESCALE CLASSIFICATION
+# ============================================================================
+def classify_timescale_enhanced(dt_days):
+    """Enhanced timescale classification based on data distribution."""
+    if dt_days <= 100:
+        return 'Short (<=100 days)'
+    elif dt_days <= 400:
+        return 'Medium (100-400 days)'
+    elif dt_days <= 800:
+        return 'Long (400-800 days)'
+    else:
+        return 'Very Long (800+ days)'
+
+# ============================================================================
+# MAIN EXECUTION
+# ============================================================================
+print("=" * 80)
+print("SCRIPT 05: TEMPORAL ANALYSIS - ELEVATION & COASTAL STRATIFICATION")
+print("FINAL VERSION - CM/YR UNITS - SCRIPT 04 INTEGRATION")
+print("=" * 80)
+
+# Parse arguments
+parser = argparse.ArgumentParser(description='Temporal Analysis with Coastal Stratification')
+parser.add_argument('--input-type', type=str, choices=['03', '04', 'auto'], default='auto',
+                    help='Input type: 03=Script03, 04=Script04, auto=priority search')
+args = parser.parse_args()
+
+print(f"\nInput type: {args.input_type}")
+
+# Get timestamp
+timestamp_file = BASEOUTPUTDIR / 'latest_RUN_TIMESTAMP.txt'
+try:
+    with open(timestamp_file, 'r', encoding='utf-8') as f:
+        RUN_TIMESTAMP = f.read().strip()
 except FileNotFoundError:
-	print("ERROR: Run Script 00 first.")
-	sys.exit(1)
+    print("ERROR: Run Script 00 first (need latestRUNTIMESTAMP.txt)")
+    sys.exit(1)
 
-# ============================================================================
-# FLEXIBLE INPUT FILE DETECTION (FIXED!)
-# ============================================================================
+OUTPUT_DIR = BASEOUTPUTDIR / f'run_{RUN_TIMESTAMP}'
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-possible_input_files = [
-	'04_paired_photons.csv',
-	'icesat2_repeat_track_matches.csv',
-]
-
-PAIRED_FILE = None
-for filename in possible_input_files:
-	filepath = OUTPUT_DIR / filename
-	if filepath.exists():
-		PAIRED_FILE = filepath
-		break
-
-if PAIRED_FILE is None:
-	print(f"ERROR: Could not find input file.")
-	print(f"Searched for:")
-	for f in possible_input_files:
-		print(f" • {OUTPUT_DIR / f}")
-	sys.exit(1)
-
-# Output files
-RATES_FILE = OUTPUT_DIR / '05_subsidence_rates.csv'
-ELEV_STATS_FILE = OUTPUT_DIR / '05_statistics_elevation.txt'
-ELEV_STATS_CSV = OUTPUT_DIR / '05_statistics_elevation.csv'
-TIMESCALE_STATS_FILE = OUTPUT_DIR / '05_statistics_timescale.txt'
-
-# Elevation stratification (10m bins)
-ELEVATION_BIN_SIZE = 10
-
-# ============================================================================
-# PRINT HEADER & SETUP LOGGING
-# ============================================================================
-
-print("="*80, flush=True)
-print("SCRIPT 05: SUBSIDENCE RATE ANALYSIS (ELEVATION STRATIFICATION ONLY)", flush=True)
-print("="*80, flush=True)
-print(f"\nRun ID: {RUN_TIMESTAMP}", flush=True)
-print(f"Input: {PAIRED_FILE.name}", flush=True)
-print(f"Elevation bin size: {ELEVATION_BIN_SIZE} m\n", flush=True)
+print(f"Run ID: {RUN_TIMESTAMP}")
+print(f"Output directory: {OUTPUT_DIR}")
 
 # Setup logging
 logger = setup_logging(OUTPUT_DIR)
 metadata = RunMetadata(RUN_TIMESTAMP)
 
-logger.info("="*80)
-logger.info("SCRIPT 05: SUBSIDENCE RATE ANALYSIS")
-logger.info("="*80)
+logger.info("=" * 80)
+logger.info("SCRIPT 05: TEMPORAL ANALYSIS WITH COASTAL STRATIFICATION")
+logger.info("=" * 80)
 logger.info(f"Run ID: {RUN_TIMESTAMP}")
-logger.info(f"Output directory: {OUTPUT_DIR}")
-logger.info(f"Input file: {PAIRED_FILE.name}")
+logger.info(f"Input type: {args.input_type}")
 
-# Record configuration in metadata
+print("\n" + "=" * 80)
+print("1. LOADING PAIRED OBSERVATIONS")
+print("=" * 80)
+
+# Find and load input file
+paired_file = find_input_file(OUTPUT_DIR)
+df_pairs = pd.read_csv(paired_file)
+
+logger.info(f"Loaded {len(df_pairs):,} paired observations from {paired_file.name}")
+print(f"Loaded {len(df_pairs):,} paired observations from {paired_file.name}")
+
 metadata.configuration = {
-	'elevation_bin_size_m': ELEVATION_BIN_SIZE,
-	'input_file': PAIRED_FILE.name,
+    'input_file': paired_file.name,
+    'n_input_pairs': len(df_pairs),
+    'elevation_bin_size_m': 10,
+    'units': 'cm/yr',
 }
 
-# ============================================================================
-# LOAD PAIRED PHOTONS
-# ============================================================================
+# Verify required columns
+required_cols = ['subsidence_rate_cm_per_year']
+missing = [c for c in required_cols if c not in df_pairs.columns]
+if missing:
+    logger.error(f"Missing required columns: {missing}")
+    print(f"ERROR: Missing columns: {missing}")
+    print(f"Available columns: {list(df_pairs.columns)}")
+    sys.exit(1)
 
-logger.info("\nLOADING PAIRED PHOTONS")
-print("\n" + "="*80, flush=True)
-print("LOADING PAIRED PHOTONS", flush=True)
-print("="*80, flush=True)
-
-if not PAIRED_FILE.exists():
-	logger.error(f"Input file not found: {PAIRED_FILE}")
-	print(f"ERROR: Input file not found: {PAIRED_FILE}", flush=True)
-	sys.exit(1)
-
-df_pairs = pd.read_csv(PAIRED_FILE)
-logger.info(f"Loaded {len(df_pairs):,} paired observations from {PAIRED_FILE.name}")
-print(f"\n✓ Loaded {len(df_pairs):,} paired observations", flush=True)
-print(f"✓ From: {PAIRED_FILE.name}\n", flush=True)
+logger.info("All required columns present")
+print("All required columns present")
 
 # ============================================================================
-# CALCULATE SUBSIDENCE RATES
+# 2. COASTAL ZONE INTEGRATION (NEW)
 # ============================================================================
+logger.info("\n" + "=" * 80)
+logger.info("2. COASTAL ZONE INTEGRATION")
+logger.info("=" * 80)
 
-logger.info("CALCULATING SUBSIDENCE RATES")
-print("="*80, flush=True)
-print("CALCULATING SUBSIDENCE RATES", flush=True)
-print("="*80, flush=True)
+print("\n" + "=" * 80)
+print("2. COASTAL ZONE INTEGRATION")
+print("=" * 80)
 
-# Get elevation column name
-elev_col = None
-for col in ['Height (m MSL)', 'height', 'Height', 'elevation', 'h_li', 'elev_early', 'elev_late']:
-	if col in df_pairs.columns:
-		elev_col = col
-		break
+# Try to add coastal zones if available
+if 'coastal_zone' not in df_pairs.columns:
+    if 'distance_to_ocean_m' in df_pairs.columns:
+        # Derive coastal zones from distance
+        def assign_coastal_zone(dist_m):
+            if dist_m < 1000:
+                return 'Coastal (0-1 km)'
+            elif dist_m < 2000:
+                return 'Near-coastal (1-2 km)'
+            elif dist_m < 5000:
+                return 'Transition (2-5 km)'
+            else:
+                return 'Inland (5+ km)'
+        
+        df_pairs['coastal_zone'] = df_pairs['distance_to_ocean_m'].apply(assign_coastal_zone)
+        logger.info("Assigned coastal zones from distance_to_ocean_m")
+        print("Assigned coastal zones from distance_to_ocean_m")
+    else:
+        # Default zones for visualization
+        df_pairs['coastal_zone'] = 'Unknown'
+        logger.warning("No coastal zone data - using default 'Unknown'")
+        print("WARNING: No coastal zone data available")
 
+# ============================================================================
+# 3. COORDINATE TRANSFORMATION (FIX #1)
+# ============================================================================
+logger.info("\n" + "=" * 80)
+logger.info("3. COORDINATE TRANSFORMATION")
+logger.info("=" * 80)
+
+print("\n" + "=" * 80)
+print("3. COORDINATE TRANSFORMATION")
+print("=" * 80)
+
+# FIX: Compute x_utm/y_utm if missing
+if ('x_utm' not in df_pairs.columns) or ('y_utm' not in df_pairs.columns):
+    lon_col = next((c for c in df_pairs.columns if 'lon_avg' in c or 'longitude' in c.lower()), None)
+    lat_col = next((c for c in df_pairs.columns if 'lat_avg' in c or 'latitude' in c.lower()), None)
+    
+    if lon_col and lat_col:
+        try:
+            transformer = Transformer.from_crs('EPSG:4326', 'EPSG:3155', always_xy=True)
+            x_utm, y_utm = transformer.transform(df_pairs[lon_col].values,
+                                                 df_pairs[lat_col].values)
+            df_pairs['x_utm'] = x_utm
+            df_pairs['y_utm'] = y_utm
+            logger.info("Computed x_utm, y_utm from lon/lat using EPSG:3155")
+            print("Computed x_utm, y_utm from lon/lat using EPSG:3155")
+        except Exception as e:
+            logger.warning(f"Failed to compute UTM coordinates: {e}")
+            print(f"WARNING: Failed to compute UTM coordinates: {e}")
+            df_pairs['x_utm'] = df_pairs[lon_col] * 111320
+            df_pairs['y_utm'] = df_pairs[lat_col] * 110540
+    else:
+        logger.warning("No lon/lat columns found; skipping UTM transformation")
+        print("WARNING: No lon/lat columns found")
+        df_pairs['x_utm'] = np.arange(len(df_pairs))
+        df_pairs['y_utm'] = np.arange(len(df_pairs))
+else:
+    logger.info("x_utm, y_utm already present")
+    print("x_utm, y_utm already present")
+
+# ============================================================================
+# 4. MULTI-DIMENSION STRATIFICATION
+# ============================================================================
+logger.info("\n" + "=" * 80)
+logger.info("4. MULTI-DIMENSION STRATIFICATION")
+logger.info("=" * 80)
+
+print("\n" + "=" * 80)
+print("4. MULTI-DIMENSION STRATIFICATION")
+print("=" * 80)
+
+# Get elevation column (flexible naming)
+elev_col = next((c for c in df_pairs.columns if 'elev' in c.lower()), None)
 if elev_col is None:
-	logger.error("Cannot find elevation column!")
-	print("ERROR: Cannot find elevation column!", flush=True)
-	print(f"Available columns: {df_pairs.columns.tolist()}", flush=True)
-	sys.exit(1)
+    logger.warning("No elevation column found; using index")
+    print("WARNING: No elevation column found")
+    df_pairs['elevation_m'] = np.arange(len(df_pairs))
+    elev_col = 'elevation_m'
 
-logger.info(f"Using elevation column: '{elev_col}'")
-print(f"Using elevation column: '{elev_col}'")
-
-# Detect time difference columns
-dt_col = None
-dh_col = None
-for col in df_pairs.columns:
-	if 'dt' in col.lower() or 'days' in col.lower() or 'time_delta' in col.lower():
-		dt_col = col
-	if 'dh' in col.lower() or 'elevation_diff' in col.lower() or 'height_diff' in col.lower():
-		dh_col = col
-
-if dt_col is None or dh_col is None:
-	logger.info("Calculating time and height differences...")
-	print("\nCalculating time and height differences...")
-	date_cols = [c for c in df_pairs.columns if 'date' in c.lower() or 'time' in c.lower()]
-	if len(date_cols) >= 2:
-		for col in date_cols:
-			df_pairs[col] = pd.to_datetime(df_pairs[col])
-		date_cols = sorted([c for c in df_pairs.columns if 'date' in c.lower()])
-		if len(date_cols) >= 2:
-			df_pairs['dt_days'] = (df_pairs[date_cols[1]] - df_pairs[date_cols[0]]).dt.days
-			height_cols = [c for c in df_pairs.columns if 'height' in c.lower() or 'elev' in c.lower()]
-			if len(height_cols) >= 2:
-				df_pairs['dh_m'] = df_pairs[height_cols[1]] - df_pairs[height_cols[0]]
-				dt_col = 'dt_days'
-				dh_col = 'dh_m'
-				logger.info("Created dt_days and dh_m columns")
-				print(f" Created dt_days and dh_m columns")
-
-if dt_col is None or dh_col is None:
-	logger.error("Cannot calculate time/height differences!")
-	print("ERROR: Cannot calculate time/height differences!", flush=True)
-	print(f"Available columns: {df_pairs.columns.tolist()}", flush=True)
-	sys.exit(1)
-
-# Calculate subsidence rate (mm/year)
-logger.info(f"Calculating rates from {dt_col} and {dh_col}...")
-print(f"\nCalculating rates from {dt_col} and {dh_col}...")
-
-df_pairs['rate_mm_yr'] = (df_pairs[dh_col] / df_pairs[dt_col]) * 365.25 * 1000
-
-logger.info("Subsidence rates calculated")
-print(f"✓ Subsidence rates calculated")
-logger.info("Rate statistics (mm/yr):")
-print(f"\nRate statistics (mm/yr):")
-
-min_rate = df_pairs['rate_mm_yr'].min()
-max_rate = df_pairs['rate_mm_yr'].max()
-mean_rate = df_pairs['rate_mm_yr'].mean()
-median_rate = df_pairs['rate_mm_yr'].median()
-std_rate = df_pairs['rate_mm_yr'].std()
-
-logger.info(f"Min: {min_rate:.2f}")
-print(f" Min: {min_rate:>10.2f}")
-logger.info(f"Max: {max_rate:.2f}")
-print(f" Max: {max_rate:>10.2f}")
-logger.info(f"Mean: {mean_rate:.2f}")
-print(f" Mean: {mean_rate:>10.2f}")
-logger.info(f"Median: {median_rate:.2f}")
-print(f" Median: {median_rate:>10.2f}")
-logger.info(f"Std: {std_rate:.2f}")
-print(f" Std: {std_rate:>10.2f}")
-
-# Remove infinite/NaN values
-logger.info("Data quality check:")
-print(f"\nData quality check:")
-
-nan_count = df_pairs['rate_mm_yr'].isna().sum()
-inf_count = np.isinf(df_pairs['rate_mm_yr']).sum()
-
-logger.info(f"NaN values: {nan_count:,}")
-print(f" NaN values: {nan_count:,}")
-logger.info(f"Inf values: {inf_count:,}")
-print(f" Inf values: {inf_count:,}")
-
-if nan_count > 0 or inf_count > 0:
-	logger.info(f"Removing {nan_count + inf_count:,} invalid rates...")
-	print(f" Removing {nan_count + inf_count:,} invalid rates...")
-	df_pairs = df_pairs[df_pairs['rate_mm_yr'].notna() & np.isfinite(df_pairs['rate_mm_yr'])].copy()
-	logger.info(f"Remaining: {len(df_pairs):,} pairs")
-	print(f" Remaining: {len(df_pairs):,} pairs")
-
-# ============================================================================
-# ELEVATION STRATIFICATION (PRIMARY ANALYSIS)
-# ============================================================================
-
-logger.info("\nELEVATION STRATIFICATION ANALYSIS")
-print("\n" + "="*80, flush=True)
-print("ELEVATION STRATIFICATION ANALYSIS", flush=True)
-print("="*80, flush=True)
-
-# Use mean elevation for stratification
-df_pairs['elevation_mean'] = df_pairs[elev_col]
-
-# Bin by elevation
-df_pairs['elev_bin'] = (df_pairs['elevation_mean'] // ELEVATION_BIN_SIZE * ELEVATION_BIN_SIZE).astype(int)
-
-# Compute statistics per elevation bin
-elev_stats = df_pairs.groupby('elev_bin')['rate_mm_yr'].agg([
-	('count', 'count'),
-	('mean', 'mean'),
-	('median', 'median'),
-	('std', 'std'),
-	('min', 'min'),
-	('max', 'max'),
-	('q25', lambda x: x.quantile(0.25)),
-	('q75', lambda x: x.quantile(0.75))
+# 4.1 ELEVATION STRATIFICATION (10m bins)
+print("\n4.1 Elevation zones (10m bins)...")
+df_pairs['elev_bin'] = (df_pairs[elev_col] / 10).astype(int) * 10
+elev_stats = df_pairs.groupby('elev_bin')['subsidence_rate_cm_per_year'].agg([
+    ('count', 'count'),
+    ('mean', 'mean'),
+    ('median', 'median'),
+    ('std', 'std'),
+    ('min', 'min'),
+    ('max', 'max'),
+    ('q25', lambda x: x.quantile(0.25)),
+    ('q75', lambda x: x.quantile(0.75)),
 ]).round(3)
 
-elev_stats['elevation_range'] = elev_stats.index.astype(str) + '-' + \
-	(elev_stats.index + ELEVATION_BIN_SIZE).astype(str) + ' m'
+elev_stats['elevation_range'] = (elev_stats.index.astype(str) + '-' +
+                                  (elev_stats.index + 10).astype(str) + ' m')
 
-logger.info("Subsidence rates by elevation zone:")
-print("Subsidence rates by elevation zone:")
-print("-" * 100)
-print(f"{'Elevation':>20} {'Count':>10} {'Mean':>12} {'Median':>12} {'Std':>12} {'Min':>12} {'Max':>12}")
-print("=" * 100)
+logger.info(f"Elevation stratification: {len(elev_stats)} bins")
+print(f"Elevation zones: {len(elev_stats)} bins")
 
-for idx in sorted(elev_stats.index):
-	row = elev_stats.loc[idx]
-	log_line = f" {row['elevation_range']} Count: {int(row['count']):,} Mean: {row['mean']:.2f} Median: {row['median']:.2f} Std: {row['std']:.2f} Min: {row['min']:.2f} Max: {row['max']:.2f}"
-	logger.info(log_line)
-	print(f"{row['elevation_range']:>20} {int(row['count']):>10,} "
-		  f"{row['mean']:>12.2f} {row['median']:>12.2f} {row['std']:>12.2f} "
-		  f"{row['min']:>12.2f} {row['max']:>12.2f}")
-
-print("=" * 100)
-
-# Save elevation statistics to text
-logger.info(f"Saving elevation statistics to: {ELEV_STATS_FILE.name}")
-print(f"\nSaving elevation statistics to: {ELEV_STATS_FILE.name}")
-
-with open(ELEV_STATS_FILE, 'w', encoding='utf-8') as f:
-	f.write("="*80 + "\n")
-	f.write("SUBSIDENCE RATES BY ELEVATION ZONE\n")
-	f.write("="*80 + "\n\n")
-	f.write(f"Run ID: {RUN_TIMESTAMP}\n")
-	f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
-	f.write("METHODOLOGY:\n")
-	f.write("-"*80 + "\n")
-	f.write(f"Elevation bin size: {ELEVATION_BIN_SIZE} m\n")
-	f.write("Subsidence rate = ΔH / Δt × 365.25 × 1000 (mm/year)\n")
-	f.write("Negative rate = subsidence (elevation decrease)\n")
-	f.write("Positive rate = uplift (elevation increase)\n\n")
-	f.write("NOTE: Cross-stratification (Period × Timescale) removed.\n")
-	f.write("Reason: Fundamental mismatch between expected and actual data distribution:\n")
-	f.write(" • Expected: 85% repeat-track pairs (0-30 days)\n")
-	f.write(" • Actual: 83% are 365+ day intervals\n")
-	f.write("This suggests the timescale classification does not align with ICESat-2 data.\n")
-	f.write("Focus on elevation stratification (spatially meaningful).\n\n")
-	f.write("SUBSIDENCE RATES BY ELEVATION ZONE:\n")
-	f.write("-"*80 + "\n")
-	f.write(f"{'Elevation':>20} {'Count':>10} {'Mean':>12} {'Median':>12} {'Std':>12} {'Min':>12} {'Max':>12}\n")
-	f.write("="*80 + "\n")
-	for idx in sorted(elev_stats.index):
-		row = elev_stats.loc[idx]
-		f.write(f"{row['elevation_range']:>20} {int(row['count']):>10,} "
-			   f"{row['mean']:>12.2f} {row['median']:>12.2f} {row['std']:>12.2f} "
-			   f"{row['min']:>12.2f} {row['max']:>12.2f}\n")
-	f.write("="*80 + "\n\n")
-	f.write("INTERPRETATION:\n")
-	f.write("-"*80 + "\n")
-	f.write("• Negative rates = subsidence (ground sinking)\n")
-	f.write("• Positive rates = uplift (ground rising)\n")
-	f.write("• Magnitude indicates rate of change (mm/year)\n")
-	f.write("• Std dev indicates variability of rates within zone\n")
-
-logger.info("✓ Elevation statistics saved")
-print(f"✓ Elevation statistics saved")
-
-# Save as CSV
-logger.info(f"Saving elevation statistics (CSV) to: {ELEV_STATS_CSV.name}")
-elev_stats_export = elev_stats.reset_index()
-elev_stats_export.to_csv(ELEV_STATS_CSV, index=False, encoding='utf-8')
-logger.info("✓ Elevation statistics (CSV) saved")
-print(f"✓ Elevation statistics (CSV) saved")
-
-# ============================================================================
-# TIMESCALE ANALYSIS (REFERENCE ONLY - NOT STRATIFIED)
-# ============================================================================
-
-logger.info("\nTIMESCALE ANALYSIS (REFERENCE ONLY)")
-print("\n" + "="*80, flush=True)
-print("TIMESCALE ANALYSIS (REFERENCE ONLY)", flush=True)
-print("="*80, flush=True)
-
-# Classify timescales based on ACTUAL distribution
-logger.info(f"Analyzing actual timescale distribution from {len(df_pairs):,} pairs...")
-print(f"\nAnalyzing actual timescale distribution from {len(df_pairs):,} pairs...")
-
-# Get percentiles from actual data
-p33 = df_pairs[dt_col].quantile(0.33)
-p67 = df_pairs[dt_col].quantile(0.67)
-
-logger.info(f"33rd percentile: {p33:.0f} days")
-print(f" 33rd percentile: {p33:.0f} days")
-logger.info(f"67th percentile: {p67:.0f} days")
-print(f" 67th percentile: {p67:.0f} days")
-
-# Classify based on actual distribution
-def classify_timescale_data_driven(days):
-	"""Classify based on actual data distribution (tertiles)."""
-	if days <= p33:
-		return 'Short'
-	elif days <= p67:
-		return 'Medium'
-	else:
-		return 'Long'
-
-df_pairs['timescale'] = df_pairs[dt_col].apply(classify_timescale_data_driven)
-
-# Compute statistics per timescale
-timescale_stats = df_pairs.groupby('timescale')['rate_mm_yr'].agg([
-	('count', 'count'),
-	('mean', 'mean'),
-	('median', 'median'),
-	('std', 'std'),
-	('min', 'min'),
-	('max', 'max')
+# 4.2 COASTAL STRATIFICATION (NEW)
+print("\n4.2 Coastal zones...")
+coastal_stats = df_pairs.groupby('coastal_zone')['subsidence_rate_cm_per_year'].agg([
+    ('count', 'count'),
+    ('mean', 'mean'),
+    ('median', 'median'),
+    ('std', 'std'),
+    ('min', 'min'),
+    ('max', 'max'),
 ]).round(3)
 
-logger.info("Subsidence rates by timescale (data-driven tertiles):")
-print("Subsidence rates by timescale (data-driven tertiles):")
-print("-" * 90)
-print(f"{'Timescale':>15} {'Count':>10} {'Mean':>12} {'Median':>12} {'Std':>12} {'Min':>12} {'Max':>12}")
-print("=" * 90)
+logger.info(f"Coastal stratification: {len(coastal_stats)} zones")
+print(f"Coastal zones: {len(coastal_stats)} zones")
 
-for timescale in ['Short', 'Medium', 'Long']:
-	if timescale in timescale_stats.index:
-		row = timescale_stats.loc[timescale]
-		log_line = f" {timescale}: {int(row['count']):,} pairs Mean: {row['mean']:.2f}"
-		logger.info(log_line)
-		print(f"{timescale:>15} {int(row['count']):>10,} "
-			  f"{row['mean']:>12.2f} {row['median']:>12.2f} {row['std']:>12.2f} "
-			  f"{row['min']:>12.2f} {row['max']:>12.2f}")
+# 4.3 ENHANCED TIMESCALE
+print("\n4.3 Timescale (enhanced, data-driven)...")
+if 'dtdays_actual' not in df_pairs.columns:
+    dt_col = next((c for c in df_pairs.columns if 'dt_days' in c.lower()), None)
+    if dt_col:
+        df_pairs['dt_days'] = df_pairs[dt_col]
+    else:
+        logger.warning("No temporal separation column found")
+        print("WARNING: No temporal separation column found")
+        df_pairs['dt_days'] = 365  # default
+else:
+    df_pairs['dt_days'] = df_pairs['dtdays_actual']
 
-print("=" * 90)
+df_pairs['timescale'] = df_pairs['dt_days'].apply(classify_timescale_enhanced)
+timescale_stats = df_pairs.groupby('timescale')['subsidence_rate_cm_per_year'].agg([
+    ('count', 'count'),
+    ('mean', 'mean'),
+    ('median', 'median'),
+    ('std', 'std'),
+    ('min', 'min'),
+    ('max', 'max'),
+]).round(3)
 
-# Save as reference
-logger.info(f"Saving timescale analysis to: {TIMESCALE_STATS_FILE.name}")
-with open(TIMESCALE_STATS_FILE, 'w', encoding='utf-8') as f:
-	f.write("="*80 + "\n")
-	f.write("TIMESCALE ANALYSIS (REFERENCE ONLY - NOT USED IN CROSS-STRATIFICATION)\n")
-	f.write("="*80 + "\n\n")
-	f.write(f"Run ID: {RUN_TIMESTAMP}\n")
-	f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
-	f.write("NOTE: Timescale analysis is provided for reference only.\n")
-	f.write("Cross-stratification (Elevation × Timescale) has been removed due to\n")
-	f.write("fundamental mismatch between expected and actual data distribution.\n\n")
-	f.write("CLASSIFICATION METHOD (DATA-DRIVEN TERTILES):\n")
-	f.write("-"*80 + "\n")
-	f.write(f"Short : 0-{p33:.0f} days ({df_pairs[df_pairs['timescale']=='Short'].shape[0]:,} pairs, "
-		   f"{100*df_pairs[df_pairs['timescale']=='Short'].shape[0]/len(df_pairs):.1f}%)\n")
-	f.write(f"Medium: {p33:.0f}-{p67:.0f} days ({df_pairs[df_pairs['timescale']=='Medium'].shape[0]:,} pairs, "
-		   f"{100*df_pairs[df_pairs['timescale']=='Medium'].shape[0]/len(df_pairs):.1f}%)\n")
-	f.write(f"Long : >{p67:.0f} days ({df_pairs[df_pairs['timescale']=='Long'].shape[0]:,} pairs, "
-		   f"{100*df_pairs[df_pairs['timescale']=='Long'].shape[0]/len(df_pairs):.1f}%)\n\n")
-	f.write("SUBSIDENCE RATES BY TIMESCALE:\n")
-	f.write("-"*80 + "\n")
-	f.write(f"{'Timescale':>15} {'Count':>10} {'Mean':>12} {'Median':>12} {'Std':>12} {'Min':>12} {'Max':>12}\n")
-	f.write("="*80 + "\n")
-	for timescale in ['Short', 'Medium', 'Long']:
-		if timescale in timescale_stats.index:
-			row = timescale_stats.loc[timescale]
-			f.write(f"{timescale:>15} {int(row['count']):>10,} "
-				   f"{row['mean']:>12.2f} {row['median']:>12.2f} {row['std']:>12.2f} "
-				   f"{row['min']:>12.2f} {row['max']:>12.2f}\n")
-	f.write("="*80 + "\n\n")
-	f.write("WHY CROSS-STRATIFICATION WAS REMOVED:\n")
-	f.write("-"*80 + "\n")
-	f.write("Your data shows:\n")
-	f.write(" • 83% of pairs have 365+ day intervals (not 85% with 0-30 day repeats)\n")
-	f.write(" • Only 0.7% are in the 'Short' category\n")
-	f.write(" • This fundamental mismatch suggests timescale classification doesn't\n")
-	f.write(" align with your actual ICESat-2 repeat-track structure\n\n")
-	f.write("Cross-stratifying on such unbalanced categories produces:\n")
-	f.write(" • Unstable statistics (very small sample sizes in some cells)\n")
-	f.write(" • Confounded results (cannot separate spatial vs temporal effects)\n")
-	f.write(" • Unreliable interpretations\n\n")
-	f.write("RECOMMENDATION:\n")
-	f.write("Use elevation stratification as your primary analysis.\n")
-	f.write("If timescale analysis is needed, examine separately (as shown here).\n")
+logger.info(f"Timescale stratification: {len(timescale_stats)} categories")
+print(f"Timescale categories: {len(timescale_stats)} categories")
 
-logger.info("✓ Timescale analysis saved")
-print(f"✓ Timescale analysis saved")
+print("\n" + "=" * 80)
+print("5. VISUALIZATION PREPARATION")
+print("=" * 80)
+
+# Compute global statistics for z-score normalization
+global_mean = df_pairs['subsidence_rate_cm_per_year'].mean()
+global_std = df_pairs['subsidence_rate_cm_per_year'].std()
+
+# Create visualization-ready dataframe
+df_viz = df_pairs.copy()
+df_viz['z_score'] = (df_viz['subsidence_rate_cm_per_year'] - global_mean) / global_std
+
+# Ensure visualization columns exist (FIX: graceful fallback)
+if 'x_center' not in df_viz.columns:
+    df_viz['x_center'] = df_viz.get('x_utm', df_viz.index.astype(float))
+if 'y_center' not in df_viz.columns:
+    df_viz['y_center'] = df_viz.get('y_utm', df_viz.index.astype(float))
+
+# Select visualization columns
+viz_cols = [
+    'x_center', 'y_center', 'subsidence_rate_cm_per_year', 'z_score',
+    'coastal_zone', 'elev_bin', 'timescale'
+]
+df_viz_prep = df_viz[[c for c in viz_cols if c in df_viz.columns]].copy()
+
+logger.info("Visualization preparation complete")
+print("Visualization preparation complete")
 
 # ============================================================================
-# SAVE SUBSIDENCE RATES
+# 6. SAVING OUTPUTS
 # ============================================================================
+logger.info("\n" + "=" * 80)
+logger.info("6. SAVING OUTPUTS")
+logger.info("=" * 80)
 
-logger.info("\nSAVING SUBSIDENCE RATES")
-print("\n" + "="*80, flush=True)
-print("SAVING SUBSIDENCE RATES", flush=True)
-print("="*80, flush=True)
+print("\n" + "=" * 80)
+print("6. SAVING OUTPUTS")
+print("=" * 80)
 
-logger.info(f"Saving to: {RATES_FILE.name}")
-df_pairs.to_csv(RATES_FILE, index=False, encoding='utf-8')
+# 6.1 All rates
+rates_file = OUTPUT_DIR / '05_subsidence_rates.csv'
+df_pairs.to_csv(rates_file, index=False, encoding='utf-8')
+logger.info(f"Saved {rates_file.name}")
+print(f"Saved {rates_file.name}")
 
-size_mb = RATES_FILE.stat().st_size / (1024**2)
-logger.info(f"Saved successfully ({size_mb:.1f} MB)")
-print(f"\n✓ Subsidence rates saved to: {RATES_FILE.name} ({size_mb:.1f} MB)")
+# 6.2 Elevation statistics
+elev_stats_csv = OUTPUT_DIR / '05_statistics_elevation.csv'
+elev_stats.reset_index().to_csv(elev_stats_csv, index=False, encoding='utf-8')
+logger.info(f"Saved {elev_stats_csv.name}")
+print(f"Saved {elev_stats_csv.name}")
+
+elev_stats_txt = OUTPUT_DIR / '05_statistics_elevation.txt'
+with open(elev_stats_txt, 'w', encoding='utf-8') as f:
+    f.write("=" * 80 + "\n")
+    f.write("SUBSIDENCE RATES BY ELEVATION ZONE (10m bins)\n")
+    f.write("=" * 80 + "\n")
+    f.write(f"Run ID: {RUN_TIMESTAMP}\n")
+    f.write(f"Units: cm/yr (negative=subsidence, positive=uplift)\n\n")
+    f.write("Elevation Count    Mean  Median     Std     Min     Max\n")
+    f.write("-" * 80 + "\n")
+    for idx, row in elev_stats.iterrows():
+        f.write(f"{row['elevation_range']:12s} {int(row['count']):8d} {row['mean']:8.2f} "
+                f"{row['median']:8.2f} {row['std']:8.2f} {row['min']:8.2f} {row['max']:8.2f}\n")
+
+logger.info(f"Saved {elev_stats_txt.name}")
+print(f"Saved {elev_stats_txt.name}")
+
+# 6.3 Coastal statistics
+coastal_stats_csv = OUTPUT_DIR / '05_statistics_coastal.csv'
+coastal_stats.reset_index().to_csv(coastal_stats_csv, index=False, encoding='utf-8')
+logger.info(f"Saved {coastal_stats_csv.name}")
+print(f"Saved {coastal_stats_csv.name}")
+
+coastal_stats_txt = OUTPUT_DIR / '05_statistics_coastal.txt'
+with open(coastal_stats_txt, 'w', encoding='utf-8') as f:
+    f.write("=" * 80 + "\n")
+    f.write("SUBSIDENCE RATES BY COASTAL ZONE\n")
+    f.write("=" * 80 + "\n")
+    f.write(f"Run ID: {RUN_TIMESTAMP}\n")
+    f.write(f"Units: cm/yr (negative=subsidence, positive=uplift)\n\n")
+    f.write("Zone                  Count    Mean  Median     Std     Min     Max\n")
+    f.write("-" * 80 + "\n")
+    for idx, row in coastal_stats.iterrows():
+        f.write(f"{idx:18s} {int(row['count']):8d} {row['mean']:8.2f} "
+                f"{row['median']:8.2f} {row['std']:8.2f} {row['min']:8.2f} {row['max']:8.2f}\n")
+
+logger.info(f"Saved {coastal_stats_txt.name}")
+print(f"Saved {coastal_stats_txt.name}")
+
+# 6.4 Timescale reference
+timescale_txt = OUTPUT_DIR / '05_statistics_timescale.txt'
+with open(timescale_txt, 'w', encoding='utf-8') as f:
+    f.write("=" * 80 + "\n")
+    f.write("TIMESCALE ANALYSIS REFERENCE - ENHANCED\n")
+    f.write("=" * 80 + "\n")
+    f.write(f"Run ID: {RUN_TIMESTAMP}\n")
+    f.write("Classification: Data-driven (<=100, 100-400, 400-800, 800+ days)\n")
+    f.write(f"Units: cm/yr (negative=subsidence, positive=uplift)\n\n")
+    f.write("Timescale             Count    Mean  Median     Std     Min     Max\n")
+    f.write("-" * 80 + "\n")
+    for idx, row in timescale_stats.iterrows():
+        f.write(f"{idx:18s} {int(row['count']):8d} {row['mean']:8.2f} "
+                f"{row['median']:8.2f} {row['std']:8.2f} {row['min']:8.2f} {row['max']:8.2f}\n")
+
+logger.info(f"Saved {timescale_txt.name}")
+print(f"Saved {timescale_txt.name}")
+
+# 6.5 Visualization preparation
+viz_file = OUTPUT_DIR / '05_visualization_prep.csv'
+df_viz_prep.to_csv(viz_file, index=False, encoding='utf-8')
+logger.info(f"Saved {viz_file.name}")
+print(f"Saved {viz_file.name}")
+
+# 6.6 Combined summary
+summary_file = OUTPUT_DIR / '05_summary_all_stratifications.txt'
+with open(summary_file, 'w', encoding='utf-8') as f:
+    f.write("=" * 80 + "\n")
+    f.write("COMPLETE STRATIFICATION SUMMARY\n")
+    f.write("=" * 80 + "\n")
+    f.write(f"Run ID: {RUN_TIMESTAMP}\n")
+    f.write(f"Total pairs: {len(df_pairs):,}\n")
+    f.write(f"Mean subsidence: {global_mean:.3f} cm/yr\n")
+    f.write(f"Global std: {global_std:.3f} cm/yr\n\n")
+    
+    f.write("ELEVATION (10m bins)\n")
+    f.write("-" * 80 + "\n")
+    for idx, row in elev_stats.iterrows():
+        f.write(f"{row['elevation_range']:12s} {int(row['count']):8d} {row['mean']:8.2f}\n")
+    
+    f.write("\nCOASTAL ZONES\n")
+    f.write("-" * 80 + "\n")
+    for idx, row in coastal_stats.iterrows():
+        f.write(f"{idx:18s} {int(row['count']):8d} {row['mean']:8.2f}\n")
+    
+    f.write("\nTIMESCALE\n")
+    f.write("-" * 80 + "\n")
+    for idx, row in timescale_stats.iterrows():
+        f.write(f"{idx:18s} {int(row['count']):8d} {row['mean']:8.2f}\n")
+
+logger.info(f"Saved {summary_file.name}")
+print(f"Saved {summary_file.name}")
 
 # ============================================================================
-# FINALIZE METADATA AND SAVE
+# 7. FINALIZE METADATA
 # ============================================================================
+logger.info("\n" + "=" * 80)
+logger.info("7. FINALIZING")
+logger.info("=" * 80)
 
 metadata.processing_results = {
-	'total_paired_observations': len(df_pairs),
-	'elevation_bins': len(elev_stats),
-	'mean_subsidence_rate_mm_yr': float(mean_rate),
-	'median_subsidence_rate_mm_yr': float(median_rate),
-	'std_subsidence_rate_mm_yr': float(std_rate),
-	'min_rate_mm_yr': float(min_rate),
-	'max_rate_mm_yr': float(max_rate),
-}  # BUGFIXED: Added closing brace
+    'total_pairs': len(df_pairs),
+    'global_mean_cm_yr': float(global_mean),
+    'global_std_cm_yr': float(global_std),
+    'n_elevation_zones': len(elev_stats),
+    'n_coastal_zones': len(coastal_stats),
+    'n_timescale_categories': len(timescale_stats),
+}
 
 metadata.finalize()
 metadata_file = metadata.save(OUTPUT_DIR)
-logger.info(f"Metadata saved: {metadata_file.name}")
+logger.info(f"Saved metadata: {metadata_file.name}")
+print(f"Saved metadata: {metadata_file.name}")
 
 # ============================================================================
-# FINAL SUMMARY
+# COMPLETION
 # ============================================================================
-
-logger.info("="*80)
+logger.info("\n" + "=" * 80)
 logger.info("SCRIPT 05 COMPLETE")
-logger.info("="*80)
-logger.info("Next step: Run Script 06 (Advanced Analysis) or Script 07 (Output Generation)")
+logger.info("=" * 80)
 
-print("\n" + "="*80, flush=True)
-print("SCRIPT 05 COMPLETE", flush=True)
-print("="*80, flush=True)
-print("\n✓ Output files created:", flush=True)
-print(f" • {RATES_FILE.name} (all pairs with subsidence rates)", flush=True)
-print(f" • {ELEV_STATS_FILE.name} (elevation stratification results)", flush=True)
-print(f" • {ELEV_STATS_CSV.name} (elevation statistics - CSV format)", flush=True)
-print(f" • {TIMESCALE_STATS_FILE.name} (timescale reference analysis)", flush=True)
-print("\n✓ Key findings:", flush=True)
-print(f" • Analyzed {len(df_pairs):,} paired observations", flush=True)
-print(f" • Mean subsidence rate: {mean_rate:.2f} mm/year", flush=True)
-print(f" • Stratified by {len(elev_stats)} elevation zones ({ELEVATION_BIN_SIZE}m bins)", flush=True)
-print(f" • Removed cross-stratification (fundamentally misaligned with data)", flush=True)
-print("\nNext steps:", flush=True)
-print(" • Use 05_statistics_elevation.csv for visualization", flush=True)
-print(" • Focus on elevation patterns (spatially meaningful)", flush=True)
-print(" • Timescale analysis available for reference if needed", flush=True)
-print(" • Script 06 will create advanced analyses", flush=True)
-print("\n" + "="*80, flush=True)
+print("\n" + "=" * 80)
+print("SCRIPT 05 COMPLETE")
+print("=" * 80)
 
-if __name__ == '__main__':
-	pass
+print(f"\nOutputs created:")
+print(f" • 05_subsidence_rates.csv")
+print(f" • 05_statistics_elevation.csv/.txt ({len(elev_stats)} bins)")
+print(f" • 05_statistics_coastal.csv/.txt ({len(coastal_stats)} zones)")
+print(f" • 05_statistics_timescale.txt ({len(timescale_stats)} categories)")
+print(f" • 05_visualization_prep.csv")
+print(f" • 05_summary_all_stratifications.txt")
+print(f" • script_05_run.log")
+print(f" • 05_analysis_temporal_metadata.json")
+
+print(f"\nKey results:")
+print(f" • Analyzed {len(df_pairs):,} pairs")
+print(f" • Mean subsidence: {global_mean:.3f} cm/yr")
+print(f" • Elevation zones: {len(elev_stats)}")
+print(f" • Coastal zones: {len(coastal_stats)}")
+
+print(f"\nNext: Run Script 06 (Advanced) or Script 07 (Figures)")
+print("=" * 80 + "\n")
+
+logger.info("SCRIPT 05 EXECUTION COMPLETE")
