@@ -1,0 +1,21 @@
+git status
+git add <files>           # or: git add .
+git commit -m "Update"
+git push                  # pushes to origin/main via SSH
+
+
+git add 05_analysis_temporal.py
+git add 05b_temporal_stratification.py
+git add 06_analysis_advanced.py
+
+git add 00_setup_validation.py
+git add 01_filter_photons.py
+git add 02_filter_terrain.py
+git add 03_analysis_core.py
+git add 04_analysis_spatial.py
+git add 05_analysis_temporal.py
+git add 05b_temporal_stratification.py
+git add 06_analysis_advanced.py
+git add 07_output_generation.py
+git add 08_run_workflow.py
+git add implementation_guide.md

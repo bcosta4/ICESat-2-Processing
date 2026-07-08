@@ -1,476 +1,608 @@
 """
 ================================================================================
-SCRIPT 05B: TEMPORAL STRATIFICATION - WITH TEXT REPORT & VISUALIZATIONS
+SCRIPT 05b: TEMPORAL STRATIFICATION & ACCELERATION METRICS
 ================================================================================
 
-FEATURES RESTORED:
-✓ Early vs Late period comparison (2019-2021 vs 2022-2024)
-✓ Robust statistics (t-test, Mann-Whitney, Kendall's tau)
-✓ Bootstrap confidence intervals
-✓ TEXT REPORT GENERATION (human-readable summary)
-✓ DISTRIBUTION HISTOGRAMS & BOXPLOTS (publication figures)
+Purpose
+-------
+Advanced temporal stratification with acceleration detection:
+1. Early vs Late period comparison (before/after 2022)
+2. Acceleration metrics (trend analysis, rate changes)
+3. Temporal acceleration summary statistics
 
-TEXT REPORT OUTPUT:
-- Human-readable .txt file with all statistics
-- Perfect for copying into thesis results section
-- Shows interpretation and significance
+Inputs
+------
+- 05_subsidence_rates.csv (Script 05 output)  — PRIORITY 1
+- icesat2_repeat_track_matches.csv (Script 03) — fallback
+- 04_spatial_grid.csv (Script 04)              — fallback
 
-VISUALIZATION OUTPUT:
-- Distribution comparison (histogram + boxplot)
-- Statistical annotations on figures
-- Publication-ready quality
+Outputs
+-------
+- icesat2_early_period.csv              (2019-2021 subsidence rates)
+- icesat2_late_period.csv               (2022-2024 subsidence rates)
+- temporal_acceleration_metrics.csv     (trend analysis)
+- 05b_temporal_stratification_report.txt (summary)
+- script_05b_run.log                    (execution log)
+- 05b_analysis_temporal_stratification_metadata.json
 
-================================================================================
+Units: ALL RATES IN CM/YR (negative=subsidence, positive=uplift)
 """
 
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
-from scipy import stats
+import json
+import logging
 from pathlib import Path
+from datetime import datetime
+from scipy.stats import linregress
 import sys
+import io
 import warnings
 
 warnings.filterwarnings('ignore')
 
-print("="*80)
-print("SCRIPT 05B: TEMPORAL STRATIFICATION - WITH TEXT REPORT & FIGURES")
-print("="*80)
-
 # ============================================================================
-# LOAD CONFIGURATION
+# FIX #3: UTF-8 output wrapper — None-safe encoding check
 # ============================================================================
+_stdout_enc = getattr(sys.stdout, 'encoding', None) or ''
+if _stdout_enc.lower() != 'utf-8':
+    try:
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+    except AttributeError:
+        pass
 
-BASE_OUTPUT_DIR = Path(r'E:\Processing\ICeSat-2\output_data')
+_stderr_enc = getattr(sys.stderr, 'encoding', None) or ''
+if _stderr_enc.lower() != 'utf-8':
+    try:
+        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
+    except AttributeError:
+        pass
 
 try:
-    with open(BASE_OUTPUT_DIR / 'latest_run_timestamp.txt', 'r') as f:
+    from config import BASEOUTPUTDIR
+except ImportError:
+    BASEOUTPUTDIR = Path(r'E:\Processing\ICeSat-2\output_data')
+
+# ============================================================================
+# LOGGING SETUP
+# ============================================================================
+def setup_logging(output_dir):
+    """Configure logging to both file and console."""
+    log_file = output_dir / 'script_05b_run.log'
+    logger = logging.getLogger('script_05b')
+    logger.setLevel(logging.DEBUG)
+    logger.handlers = []
+
+    fh = logging.FileHandler(log_file, encoding='utf-8', mode='w')
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(logging.Formatter(
+        '%(asctime)s [%(levelname)s] %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    ))
+
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.INFO)
+    ch.setFormatter(logging.Formatter('%(message)s'))
+
+    logger.addHandler(fh)
+    logger.addHandler(ch)
+    return logger
+
+
+# ============================================================================
+# METADATA TRACKING
+# ============================================================================
+class RunMetadata:
+    """Capture complete run parameters for reproducibility."""
+
+    def __init__(self, run_id):
+        self.run_id = run_id
+        self.script_name = '05b_analysis_temporal_stratification'
+        self.script_version = 'v2.2-all-fixes'
+        self.start_time = datetime.now().isoformat()
+        self.end_time = None
+        self.configuration = {}
+        self.processing_results = {}
+        self.environment_info = {
+            'python_version': f'{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}',
+            'platform': sys.platform,
+            'timestamp': datetime.now().isoformat(),
+        }
+
+    def finalize(self):
+        self.end_time = datetime.now().isoformat()
+
+    def save(self, output_dir):
+        metadata_file = output_dir / '05b_analysis_temporal_stratification_metadata.json'
+        metadata = {
+            'run_id': self.run_id,
+            'script': self.script_name,
+            'version': self.script_version,
+            'environment': self.environment_info,
+            'timestamps': {'start': self.start_time, 'end': self.end_time},
+            'configuration': self.configuration,
+            'processing_results': self.processing_results,
+        }
+        with open(metadata_file, 'w', encoding='utf-8') as f:
+            json.dump(metadata, f, indent=2, default=str, ensure_ascii=False)
+        return metadata_file
+
+
+# ============================================================================
+# UTILITY: FIND INPUT FILE
+# ============================================================================
+def find_input_file(output_dir):
+    """Find input file with priority order."""
+    priority_files = [
+        output_dir / '05_subsidence_rates.csv',           # Script 05 (PRIORITY 1)
+        output_dir / 'icesat2_repeat_track_matches.csv',  # Script 03 (fallback)
+        output_dir / '04_spatial_grid.csv',               # Script 04 (fallback)
+    ]
+    for filepath in priority_files:
+        if filepath.exists():
+            return filepath
+
+    print("ERROR: Could not find input file.")
+    print("Searched for:")
+    for f in priority_files:
+        print(f"  - {f.name}")
+    sys.exit(1)
+
+
+# ============================================================================
+# UTILITY: FLEXIBLE DATE COLUMN DETECTION
+# FIX #1 + FIX #6: flexible detection; bare except replaced with explicit catch
+# ============================================================================
+def extract_datetime_from_df(df, logger=None):
+    """
+    Flexibly detect and extract datetime from CSV columns.
+    Tries in order: 'datetime', 'date', 'date_early', 'date_late', 'year'.
+    Never uses a bare except clause.
+    """
+    datetime_col_candidates = ['datetime', 'date', 'date_early', 'date_late']
+
+    for col in datetime_col_candidates:
+        if col in df.columns:
+            try:
+                dt = pd.to_datetime(df[col])
+                if logger:
+                    logger.info(f"Extracted datetime from column: '{col}'")
+                print(f"Extracted datetime from column: '{col}'")
+                return dt
+            except Exception as e:
+                if logger:
+                    logger.warning(f"Failed to parse '{col}' as datetime: {e}")
+                continue
+
+    # Fallback: year column
+    if 'year' in df.columns:
+        try:
+            dt = pd.to_datetime(df['year'], format='%Y')
+            if logger:
+                logger.warning("Using 'year' column as datetime (year-only, no month/day)")
+            print("WARNING: Using 'year' column as datetime (year-only)")
+            return dt
+        except Exception as e:
+            if logger:
+                logger.warning(f"Failed to parse 'year' column as datetime: {e}")
+
+    # All attempts failed
+    if logger:
+        logger.error(f"Could not find datetime column. Available: {list(df.columns)}")
+    print(f"ERROR: Could not find datetime column. Available: {list(df.columns)}")
+    sys.exit(1)
+
+
+# ============================================================================
+# UTILITY: PERIOD STATISTICS
+# ============================================================================
+def compute_period_stats(df_period, period_name, logger=None):
+    """Compute comprehensive statistics for a time period.
+    Returns None (with a warning) if no valid rates exist."""
+    rates = df_period['subsidence_rate_cm_per_year'].dropna().values
+
+    if len(rates) == 0:
+        if logger:
+            logger.warning(f"No valid rates in {period_name} — returning None")
+        print(f"WARNING: No valid rates in {period_name}")
+        return None
+
+    n = len(rates)
+    stderr = np.std(rates) / np.sqrt(n)
+    stats = {
+        'period':                  period_name,
+        'n_observations':          n,
+        'mean_subsidence_cm_yr':   float(np.mean(rates)),
+        'median_subsidence_cm_yr': float(np.median(rates)),
+        'std_subsidence_cm_yr':    float(np.std(rates)),
+        'std_error_cm_yr':         float(stderr),
+        'ci_lower_95_cm_yr':       float(np.mean(rates) - 1.96 * stderr),
+        'ci_upper_95_cm_yr':       float(np.mean(rates) + 1.96 * stderr),
+        'min_subsidence_cm_yr':    float(np.min(rates)),
+        'max_subsidence_cm_yr':    float(np.max(rates)),
+        'q25_subsidence_cm_yr':    float(np.percentile(rates, 25)),
+        'q75_subsidence_cm_yr':    float(np.percentile(rates, 75)),
+    }
+
+    if logger:
+        logger.info(f"{period_name}: mean={stats['mean_subsidence_cm_yr']:.3f} cm/yr, "
+                    f"n={n:,}")
+    return stats
+
+
+# ============================================================================
+# UTILITY: SAFE RELATIVE CHANGE
+# ============================================================================
+def safe_relative_change(change, reference):
+    """Return relative change % or 0.0 if reference is zero."""
+    if reference != 0:
+        return (change / abs(reference)) * 100.0
+    return 0.0
+
+
+# ============================================================================
+# MAIN EXECUTION
+# ============================================================================
+print("=" * 80)
+print("SCRIPT 05b: TEMPORAL STRATIFICATION & ACCELERATION METRICS")
+print("WITH EARLY/LATE PERIOD COMPARISON")
+print("=" * 80)
+
+# --------------------------------------------------------------------------
+# Timestamp & output directory
+# --------------------------------------------------------------------------
+timestamp_file = BASEOUTPUTDIR / 'latest_RUN_TIMESTAMP.txt'
+try:
+    with open(timestamp_file, 'r', encoding='utf-8') as f:
         RUN_TIMESTAMP = f.read().strip()
-    OUTPUT_DIR = BASE_OUTPUT_DIR / f'run_{RUN_TIMESTAMP}'
 except FileNotFoundError:
-    print("ERROR: Timestamp file not found. Run Script 00 first.")
+    print("ERROR: Run Script 00 first (need latest_RUN_TIMESTAMP.txt)")
     sys.exit(1)
 
-print(f"\nRun ID: {RUN_TIMESTAMP}\n")
+OUTPUT_DIR = BASEOUTPUTDIR / f'run_{RUN_TIMESTAMP}'
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+print(f"Run ID:           {RUN_TIMESTAMP}")
+print(f"Output directory: {OUTPUT_DIR}")
+
+logger   = setup_logging(OUTPUT_DIR)
+metadata = RunMetadata(RUN_TIMESTAMP)
+
+logger.info("=" * 80)
+logger.info("SCRIPT 05b: TEMPORAL STRATIFICATION & ACCELERATION METRICS")
+logger.info("=" * 80)
+logger.info(f"Run ID: {RUN_TIMESTAMP}")
 
 # ============================================================================
-# LOAD DATA
+# 1. LOAD DATA
 # ============================================================================
+print("\n" + "=" * 80)
+print("1. LOADING DATA")
+print("=" * 80)
+logger.info("=" * 80)
+logger.info("1. LOADING DATA")
+logger.info("=" * 80)
 
-print("="*80)
-print("LOADING DATA")
-print("="*80 + "\n")
+input_file = find_input_file(OUTPUT_DIR)
+df = pd.read_csv(input_file)
 
-try:
-    data = pd.read_csv(OUTPUT_DIR / 'icesat2_repeat_track_matches.csv')
-    print(f"✓ Loaded {len(data):,} crossover points\n")
-except FileNotFoundError:
-    print("ERROR: icesat2_repeat_track_matches.csv not found!")
+logger.info(f"Loaded {len(df):,} observations from {input_file.name}")
+print(f"Loaded {len(df):,} observations from {input_file.name}")
+
+if 'subsidence_rate_cm_per_year' not in df.columns:
+    logger.error("Missing 'subsidence_rate_cm_per_year' column")
+    print("ERROR: Missing 'subsidence_rate_cm_per_year' column")
     sys.exit(1)
 
-# ============================================================================
-# AUTO-DETECT REQUIRED COLUMNS
-# ============================================================================
+logger.info("Rate column verified: 'subsidence_rate_cm_per_year'")
+print("Rate column verified")
 
-possible_lat = ['latitude', 'lat', 'ref_lat', 'latitude_mean', 'y', 'lat_early', 'lat_avg']
-possible_lon = ['longitude', 'lon', 'ref_lon', 'longitude_mean', 'x', 'lon_early', 'lon_avg']
-possible_rate = ['dh_fit_dx', 'subsidence_rate_m_per_yr', 'rate', 'height_change', 'subsidence_rate_m_per_year']
-possible_date = ['date', 'time', 'acquisition_date', 'ref_date', 'datetime', 'date_early']
-
-lat_col = next((c for c in data.columns if any(x in c.lower() for x in possible_lat)), None)
-lon_col = next((c for c in data.columns if any(x in c.lower() for x in possible_lon)), None)
-rate_col = next((c for c in data.columns if any(x in c.lower() for x in possible_rate)), None)
-date_col = next((c for c in data.columns if any(x in c.lower() for x in possible_date)), None)
-
-if None in [lat_col, lon_col, rate_col, date_col]:
-    print("\nERROR: Could not auto-detect required columns!")
-    print(f"Available: {list(data.columns)}")
-    sys.exit(1)
-
-print(f"✓ Detected columns:")
-print(f" Latitude: {lat_col}")
-print(f" Longitude: {lon_col}")
-print(f" Rate: {rate_col}")
-print(f" Date: {date_col}\n")
+# FIX #9: sign_convention in metadata
+metadata.configuration = {
+    'input_file':         input_file.name,
+    'n_observations':     len(df),
+    'units':              'cm/yr',
+    'sign_convention':    'negative=subsidence, positive=uplift',
+    'early_period_year':  2022,
+}
 
 # ============================================================================
-# CONVERT DATES & FILTER
+# 2. EXTRACT AND PARSE DATETIME
 # ============================================================================
+print("\n" + "=" * 80)
+print("2. EXTRACTING DATETIME")
+print("=" * 80)
+logger.info("=" * 80)
+logger.info("2. EXTRACTING DATETIME")
+logger.info("=" * 80)
 
-data[date_col] = pd.to_datetime(data[date_col], errors='coerce')
-data = data.dropna(subset=[date_col])
+df['datetime'] = extract_datetime_from_df(df, logger)
+df['year']     = df['datetime'].dt.year
+df['month']    = df['datetime'].dt.month
 
-data_filtered = data.copy()
-print(f"✓ Using all {len(data_filtered):,} points\n")
-
-# ============================================================================
-# DETERMINE TEMPORAL SPLIT
-# ============================================================================
-
-date_min = data_filtered[date_col].min()
-date_max = data_filtered[date_col].max()
-date_span = (date_max - date_min).days / 365.25
-
-print(f"Data time range:")
-print(f" Start: {date_min.strftime('%Y-%m-%d')}")
-print(f" End: {date_max.strftime('%Y-%m-%d')}")
-print(f" Span: {date_span:.2f} years\n")
-
-# Fixed year-based split
-SPLIT_YEAR = 2021
-split_date = pd.to_datetime(f'{SPLIT_YEAR}-12-31')
-
-print(f"Split method: FIXED YEAR CUTOFF")
-print(f"Split date: {split_date.strftime('%Y-%m-%d')}\n")
+logger.info(f"Year range: {df['year'].min()} - {df['year'].max()}")
+print(f"Year range: {df['year'].min()} - {df['year'].max()}")
 
 # ============================================================================
-# SPLIT INTO EARLY & LATE PERIODS
+# 3. EARLY/LATE PERIOD STRATIFICATION
 # ============================================================================
+print("\n" + "=" * 80)
+print("3. EARLY/LATE PERIOD STRATIFICATION")
+print("=" * 80)
+logger.info("=" * 80)
+logger.info("3. EARLY/LATE PERIOD STRATIFICATION")
+logger.info("=" * 80)
 
-early = data_filtered[data_filtered[date_col] < split_date].copy()
-late = data_filtered[data_filtered[date_col] >= split_date].copy()
+EARLY_CUTOFF_YEAR = 2022
 
-early['temporal_period'] = 'early'
-late['temporal_period'] = 'late'
+df_early = df[df['year'] < EARLY_CUTOFF_YEAR].copy()
+df_late  = df[df['year'] >= EARLY_CUTOFF_YEAR].copy()
 
-print("="*80)
-print("TEMPORAL PERIOD STATISTICS")
-print("="*80)
+logger.info(f"Early period (<{EARLY_CUTOFF_YEAR}):  {len(df_early):,} observations")
+logger.info(f"Late period  (>={EARLY_CUTOFF_YEAR}): {len(df_late):,} observations")
+print(f"Early period (<{EARLY_CUTOFF_YEAR}):  {len(df_early):,} observations")
+print(f"Late period  (>={EARLY_CUTOFF_YEAR}): {len(df_late):,} observations")
 
-print(f"\nEARLY PERIOD: {early[date_col].min().strftime('%Y-%m-%d')} to {early[date_col].max().strftime('%Y-%m-%d')}")
-print(f" Points: {len(early):,}")
-print(f" Mean: {early[rate_col].mean()*1000:.2f} mm/yr")
-print(f" Median: {early[rate_col].median()*1000:.2f} mm/yr")
-print(f" Std: {early[rate_col].std()*1000:.2f} mm/yr")
+early_stats = compute_period_stats(df_early, 'Early (2019-2021)', logger)
+late_stats  = compute_period_stats(df_late,  'Late (2022-2024)',  logger)
 
-print(f"\nLATE PERIOD: {late[date_col].min().strftime('%Y-%m-%d')} to {late[date_col].max().strftime('%Y-%m-%d')}")
-print(f" Points: {len(late):,}")
-print(f" Mean: {late[rate_col].mean()*1000:.2f} mm/yr")
-print(f" Median: {late[rate_col].median()*1000:.2f} mm/yr")
-print(f" Std: {late[rate_col].std()*1000:.2f} mm/yr")
-
-# ============================================================================
-# ROBUST STATISTICAL ANALYSIS
-# ============================================================================
-
-print(f"\n" + "="*80)
-print(f"ROBUST STATISTICAL ANALYSIS")
-print(f"="*80)
-
-# Basic statistics
-early_rates = early[rate_col].dropna().values * 1000  # Convert to mm/yr
-late_rates = late[rate_col].dropna().values * 1000
-
-mean_change = late_rates.mean() - early_rates.mean()
-percent_change = (mean_change / early_rates.mean()) * 100 if early_rates.mean() != 0 else 0
-
-# Parametric test
-t_stat, t_pval = stats.ttest_ind(early_rates, late_rates)
-
-# Non-parametric test
-u_stat, u_pval = stats.mannwhitneyu(early_rates, late_rates, alternative='two-sided')
-
-# Kendall's tau (trend test)
-early_dates_numeric = (early[date_col] - early[date_col].min()).dt.days.values
-late_dates_numeric = (late[date_col] - late[date_col].min()).dt.days.values
-combined_dates_numeric = np.concatenate([
-    early_dates_numeric,
-    late_dates_numeric + (early[date_col].max() - early[date_col].min()).days
-])
-combined_rates = np.concatenate([early_rates, late_rates])
-tau_stat, tau_pval = stats.kendalltau(combined_dates_numeric, combined_rates)
-
-# Effect size (Cohen's d)
-pooled_std = np.sqrt((early_rates.std()**2 + late_rates.std()**2) / 2)
-cohens_d = mean_change / pooled_std if pooled_std > 0 else 0
-
-# Robust spread: Median Absolute Deviation (MAD)
-early_mad = np.median(np.abs(early_rates - early_rates.mean()))
-late_mad = np.median(np.abs(late_rates - late_rates.mean()))
-
-# Change velocity
-time_span_years = (late[date_col].max() - early[date_col].min()).days / 365.25
-change_velocity = mean_change / time_span_years if time_span_years > 0 else 0
-
-# Bootstrap confidence intervals
-print(f"\nComputing bootstrap confidence intervals (n=1000)...")
-bootstrap_changes = []
-np.random.seed(42)
-
-for _ in range(1000):
-    early_sample = np.random.choice(early_rates, size=len(early_rates), replace=True)
-    late_sample = np.random.choice(late_rates, size=len(late_rates), replace=True)
-    bootstrap_changes.append(late_sample.mean() - early_sample.mean())
-
-bootstrap_changes = np.array(bootstrap_changes)
-ci_lower, ci_upper = np.percentile(bootstrap_changes, [2.5, 97.5])
-ci_mean = np.mean(bootstrap_changes)
-ci_std = np.std(bootstrap_changes)
-
-# Determine direction
-if mean_change > 0:
-    direction = "DECELERATING"
-    direction_desc = "(subsidence improving/stabilizing)"
-elif mean_change < 0:
-    direction = "ACCELERATING"
-    direction_desc = "(subsidence worsening)"
+# FIX #5: None-guard every direct access
+if early_stats:
+    print(f"\nEarly period mean: {early_stats['mean_subsidence_cm_yr']:.3f} cm/yr")
 else:
-    direction = "STABLE"
-    direction_desc = "(no significant change)"
+    print("\nEarly period: no valid observations")
 
-print(f"\nMean subsidence rate change:")
-print(f" Early: {early_rates.mean():.2f} mm/yr")
-print(f" Late: {late_rates.mean():.2f} mm/yr")
-print(f" Change: {mean_change:.2f} mm/yr ({percent_change:+.1f}%)")
-print(f" Change velocity: {change_velocity:.4f} mm/yr/year")
-print(f" Direction: {direction} {direction_desc}")
-
-print(f"\nParametric and Non-parametric Tests:")
-print(f" T-test: t={t_stat:.4f}, p={t_pval:.6f} {'✓ SIGNIFICANT' if t_pval < 0.05 else '✗ not significant'}")
-print(f" Mann-Whitney U: U={u_stat:.2f}, p={u_pval:.6f}")
-print(f" Kendall's tau: τ={tau_stat:.4f}, p={tau_pval:.6f}")
-print(f" Cohen's d: {cohens_d:.3f}", end=' ')
-
-if abs(cohens_d) < 0.2:
-    print("(negligible effect)")
-elif abs(cohens_d) < 0.5:
-    print("(small effect)")
-elif abs(cohens_d) < 0.8:
-    print("(medium effect)")
+if late_stats:
+    print(f"Late period mean:  {late_stats['mean_subsidence_cm_yr']:.3f} cm/yr")
 else:
-    print("(large effect)")
-
-print(f"\nRobust Statistics (Median Absolute Deviation):")
-print(f" Early MAD: {early_mad:.2f} mm/yr")
-print(f" Late MAD: {late_mad:.2f} mm/yr")
-
-print(f"\nBootstrap 95% Confidence Interval on Change:")
-print(f" [{ci_lower:.2f}, {ci_upper:.2f}] mm/yr")
-print(f" Mean: {ci_mean:.2f} mm/yr, Std: {ci_std:.2f} mm/yr")
+    print("Late period: no valid observations")
 
 # ============================================================================
-# SAVE STRATIFIED DATA
+# 4. SAVE EARLY/LATE PERIOD DATA
 # ============================================================================
+print("\n" + "=" * 80)
+print("4. SAVING EARLY/LATE PERIOD DATA")
+print("=" * 80)
+logger.info("=" * 80)
+logger.info("4. SAVING EARLY/LATE PERIOD DATA")
+logger.info("=" * 80)
 
-print(f"\n" + "="*80)
-print(f"SAVING OUTPUTS")
-print(f"="*80 + "\n")
+early_file = OUTPUT_DIR / 'icesat2_early_period.csv'
+df_early.to_csv(early_file, index=False, encoding='utf-8')
+logger.info(f"Saved {early_file.name}")
+print(f"Saved {early_file.name}")
 
-print(f"Saving stratified datasets...")
+late_file = OUTPUT_DIR / 'icesat2_late_period.csv'
+df_late.to_csv(late_file, index=False, encoding='utf-8')
+logger.info(f"Saved {late_file.name}")
+print(f"Saved {late_file.name}")
 
-early.to_csv(OUTPUT_DIR / 'icesat2_early_period.csv', index=False)
-late.to_csv(OUTPUT_DIR / 'icesat2_late_period.csv', index=False)
+# ============================================================================
+# 5. ACCELERATION METRICS
+# ============================================================================
+print("\n" + "=" * 80)
+print("5. ACCELERATION METRICS & TREND ANALYSIS")
+print("=" * 80)
+logger.info("=" * 80)
+logger.info("5. ACCELERATION METRICS & TREND ANALYSIS")
+logger.info("=" * 80)
 
-print(f" ✓ icesat2_early_period.csv")
-print(f" ✓ icesat2_late_period.csv")
+acceleration_metrics = []
+
+# Metric 1: Period mean comparison
+if early_stats and late_stats:
+    acceleration = (late_stats['mean_subsidence_cm_yr']
+                    - early_stats['mean_subsidence_cm_yr'])
+    rel_change   = safe_relative_change(acceleration,
+                                        early_stats['mean_subsidence_cm_yr'])
+    acceleration_metrics.append({
+        'Metric':                  'Period Acceleration (Late - Early)',
+        'Early_Period':            early_stats['mean_subsidence_cm_yr'],
+        'Late_Period':             late_stats['mean_subsidence_cm_yr'],
+        'Change_cm_yr':            acceleration,
+        'Relative_Change_Percent': rel_change,
+    })
+    logger.info(f"Period acceleration: {acceleration:.3f} cm/yr ({rel_change:.1f}%)")
+    print(f"Period acceleration: {acceleration:.3f} cm/yr ({rel_change:.1f}%)")
+
+# Metric 2: Linear temporal trend on all data
+# FIX #7: np.isfinite() mask applied before linregress
+df_trend = df.dropna(subset=['subsidence_rate_cm_per_year', 'datetime']).copy()
+
+if len(df_trend) > 1:
+    x_days = ((df_trend['datetime'] - df_trend['datetime'].min())
+               .dt.total_seconds() / 86400.0).values
+    y_rates = df_trend['subsidence_rate_cm_per_year'].values
+
+    finite_mask = np.isfinite(x_days) & np.isfinite(y_rates)
+    x_clean     = x_days[finite_mask]
+    y_clean     = y_rates[finite_mask]
+
+    if len(x_clean) > 1 and np.std(x_clean) > 0:
+        slope, intercept, r_value, p_value, std_err = linregress(x_clean, y_clean)
+        annual_trend = slope * 365.25   # cm/yr per year
+
+        rel_trend = (safe_relative_change(annual_trend,
+                                          early_stats['mean_subsidence_cm_yr'])
+                     if early_stats else np.nan)
+
+        acceleration_metrics.append({
+            'Metric':                  'Temporal Trend (All Data)',
+            'Early_Period':            early_stats['mean_subsidence_cm_yr'] if early_stats else np.nan,
+            'Late_Period':             late_stats['mean_subsidence_cm_yr']  if late_stats  else np.nan,
+            'Change_cm_yr':            annual_trend,
+            'Relative_Change_Percent': rel_trend,
+        })
+        logger.info(f"Annual trend: {annual_trend:.4f} cm/yr/yr "
+                    f"(R²={r_value**2:.3f}, p={p_value:.2e})")
+        print(f"Annual trend: {annual_trend:.4f} cm/yr/yr "
+              f"(R²={r_value**2:.3f}, p={p_value:.2e})")
+    else:
+        logger.warning("Insufficient finite data points for temporal trend regression")
+        print("WARNING: Insufficient finite data for temporal trend regression")
+
+# Metric 3: Variability (std dev) comparison
+if early_stats and late_stats:
+    std_change  = (late_stats['std_subsidence_cm_yr']
+                   - early_stats['std_subsidence_cm_yr'])
+    rel_std     = safe_relative_change(std_change,
+                                       early_stats['std_subsidence_cm_yr'])
+    acceleration_metrics.append({
+        'Metric':                  'Std Dev Change',
+        'Early_Period':            early_stats['std_subsidence_cm_yr'],
+        'Late_Period':             late_stats['std_subsidence_cm_yr'],
+        'Change_cm_yr':            std_change,
+        'Relative_Change_Percent': rel_std,
+    })
 
 # Save acceleration metrics
-acceleration_metrics = pd.DataFrame({
-    'metric': [
-        'early_mean_mm_per_yr',
-        'late_mean_mm_per_yr',
-        'change_mm_per_yr',
-        'change_velocity_mm_yr_per_yr',
-        'percent_change_percent',
-        'direction',
-        'n_early',
-        'n_late',
-        't_statistic',
-        't_pvalue',
-        'u_statistic',
-        'u_pvalue',
-        'kendall_tau',
-        'kendall_pvalue',
-        'cohens_d',
-        'early_mad_mm_yr',
-        'late_mad_mm_yr',
-        'bootstrap_mean_mm_yr',
-        'bootstrap_std_mm_yr',
-        'bootstrap_ci_lower_mm_yr',
-        'bootstrap_ci_upper_mm_yr',
-        'time_span_years'
-    ],
-    'value': [
-        early_rates.mean(),
-        late_rates.mean(),
-        mean_change,
-        change_velocity,
-        percent_change,
-        direction,
-        len(early),
-        len(late),
-        t_stat,
-        t_pval,
-        u_stat,
-        u_pval,
-        tau_stat,
-        tau_pval,
-        cohens_d,
-        early_mad,
-        late_mad,
-        ci_mean,
-        ci_std,
-        ci_lower,
-        ci_upper,
-        time_span_years
-    ]
-})
-
-acceleration_metrics.to_csv(OUTPUT_DIR / 'temporal_acceleration_metrics.csv', index=False)
-print(f" ✓ temporal_acceleration_metrics.csv")
+accel_file = OUTPUT_DIR / 'temporal_acceleration_metrics.csv'
+df_accel   = pd.DataFrame(acceleration_metrics)
+df_accel.to_csv(accel_file, index=False, encoding='utf-8')
+logger.info(f"Saved {accel_file.name} ({len(df_accel)} metrics)")
+print(f"Saved {accel_file.name} ({len(df_accel)} metrics)")
 
 # ============================================================================
-# TEXT REPORT GENERATION - RESTORED
+# 6. GENERATE REPORT
 # ============================================================================
+print("\n" + "=" * 80)
+print("6. GENERATING TEMPORAL STRATIFICATION REPORT")
+print("=" * 80)
+logger.info("=" * 80)
+logger.info("6. GENERATING TEMPORAL STRATIFICATION REPORT")
+logger.info("=" * 80)
 
-print(f"Generating text report...")
+report_file = OUTPUT_DIR / '05b_temporal_stratification_report.txt'
+with open(report_file, 'w', encoding='utf-8') as f:
+    f.write("=" * 80 + "\n")
+    f.write("SCRIPT 05b: TEMPORAL STRATIFICATION & ACCELERATION METRICS\n")
+    f.write("=" * 80 + "\n\n")
+    f.write(f"Run ID:             {RUN_TIMESTAMP}\n")
+    f.write(f"Generated:          {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+    f.write(f"Data period:        {df['year'].min()}-{df['year'].max()}\n")
+    f.write(f"Total observations: {len(df):,}\n")
+    f.write(f"Sign convention:    negative=subsidence, positive=uplift\n\n")
 
-with open(OUTPUT_DIR / 'temporal_period_statistics.txt', 'w', encoding='utf-8') as f:
-    f.write("="*80 + "\n")
-    f.write("TEMPORAL PERIOD STRATIFICATION & ROBUST ACCELERATION ANALYSIS\n")
-    f.write("="*80 + "\n\n")
-    
-    f.write(f"SPLIT METHOD: FIXED YEAR CUTOFF\n")
-    f.write(f"SPLIT DATE: {split_date.strftime('%Y-%m-%d')}\n\n")
-    
-    f.write(f"EARLY PERIOD: {early[date_col].min().strftime('%Y-%m-%d')} to {early[date_col].max().strftime('%Y-%m-%d')}\n")
-    f.write(f" Points: {len(early):,}\n")
-    f.write(f" Mean: {early_rates.mean():.2f} mm/yr\n")
-    f.write(f" Median: {np.median(early_rates):.2f} mm/yr\n")
-    f.write(f" Std dev: {early_rates.std():.2f} mm/yr\n")
-    f.write(f" MAD: {early_mad:.2f} mm/yr\n\n")
-    
-    f.write(f"LATE PERIOD: {late[date_col].min().strftime('%Y-%m-%d')} to {late[date_col].max().strftime('%Y-%m-%d')}\n")
-    f.write(f" Points: {len(late):,}\n")
-    f.write(f" Mean: {late_rates.mean():.2f} mm/yr\n")
-    f.write(f" Median: {np.median(late_rates):.2f} mm/yr\n")
-    f.write(f" Std dev: {late_rates.std():.2f} mm/yr\n")
-    f.write(f" MAD: {late_mad:.2f} mm/yr\n\n")
-    
-    f.write(f"TEMPORAL ACCELERATION/DECELERATION:\n")
-    f.write(f" Change: {mean_change:.2f} mm/yr ({percent_change:+.1f}%)\n")
-    f.write(f" Change velocity: {change_velocity:.4f} mm/yr/year\n")
-    f.write(f" Direction: {direction} {direction_desc}\n")
-    f.write(f" Time span: {time_span_years:.2f} years\n\n")
-    
-    f.write(f"STATISTICAL SIGNIFICANCE:\n")
-    f.write(f" T-test p-value: {t_pval:.6f} {'✓ SIGNIFICANT' if t_pval < 0.05 else '✗ not significant'}\n")
-    f.write(f" Mann-Whitney p-value: {u_pval:.6f}\n")
-    f.write(f" Kendall tau: {tau_stat:.4f}, p={tau_pval:.6f}\n")
-    f.write(f" Cohen's d: {cohens_d:.3f}\n\n")
-    
-    f.write(f"BOOTSTRAP CONFIDENCE INTERVALS (95%, n=1000):\n")
-    f.write(f" 95% CI on change: [{ci_lower:.2f}, {ci_upper:.2f}] mm/yr\n")
-    f.write(f" Bootstrap mean: {ci_mean:.2f} ± {ci_std:.2f} mm/yr\n\n")
-    
-    f.write(f"INTERPRETATION:\n")
-    if abs(cohens_d) >= 0.8:
-        f.write(f" • Large effect size (Cohen's d={cohens_d:.3f})\n")
-    elif abs(cohens_d) >= 0.5:
-        f.write(f" • Medium effect size (Cohen's d={cohens_d:.3f})\n")
-    elif abs(cohens_d) >= 0.2:
-        f.write(f" • Small effect size (Cohen's d={cohens_d:.3f})\n")
+    # Early period
+    f.write("=" * 80 + "\n")
+    f.write("EARLY PERIOD (2019-2021)\n")
+    f.write("=" * 80 + "\n")
+    if early_stats:
+        f.write(f"Observations: {early_stats['n_observations']:,}\n")
+        f.write(f"Mean subsidence:  {early_stats['mean_subsidence_cm_yr']:.3f} cm/yr\n")
+        f.write(f"Median:           {early_stats['median_subsidence_cm_yr']:.3f} cm/yr\n")
+        f.write(f"Std dev:          {early_stats['std_subsidence_cm_yr']:.3f} cm/yr\n")
+        f.write(f"95% CI:           [{early_stats['ci_lower_95_cm_yr']:.3f}, "
+                f"{early_stats['ci_upper_95_cm_yr']:.3f}] cm/yr\n")
+        f.write(f"Range:            {early_stats['min_subsidence_cm_yr']:.3f} to "
+                f"{early_stats['max_subsidence_cm_yr']:.3f} cm/yr\n\n")
     else:
-        f.write(f" • Negligible effect size (Cohen's d={cohens_d:.3f})\n")
-    
-    if t_pval < 0.05:
-        f.write(f" • Temporal change is statistically SIGNIFICANT (p={t_pval:.6f})\n")
+        f.write("No valid observations in early period.\n\n")
+
+    # Late period
+    f.write("=" * 80 + "\n")
+    f.write("LATE PERIOD (2022-2024)\n")
+    f.write("=" * 80 + "\n")
+    if late_stats:
+        f.write(f"Observations: {late_stats['n_observations']:,}\n")
+        f.write(f"Mean subsidence:  {late_stats['mean_subsidence_cm_yr']:.3f} cm/yr\n")
+        f.write(f"Median:           {late_stats['median_subsidence_cm_yr']:.3f} cm/yr\n")
+        f.write(f"Std dev:          {late_stats['std_subsidence_cm_yr']:.3f} cm/yr\n")
+        f.write(f"95% CI:           [{late_stats['ci_lower_95_cm_yr']:.3f}, "
+                f"{late_stats['ci_upper_95_cm_yr']:.3f}] cm/yr\n")
+        f.write(f"Range:            {late_stats['min_subsidence_cm_yr']:.3f} to "
+                f"{late_stats['max_subsidence_cm_yr']:.3f} cm/yr\n\n")
     else:
-        f.write(f" • Temporal change is not statistically significant (p={t_pval:.6f})\n")
-    
-    if mean_change > 0:
-        f.write(f" • Subsidence DECELERATING (stabilizing/improving)\n")
-        f.write(f" Early mean of {early_rates.mean():.2f} mm/yr declining to {late_rates.mean():.2f} mm/yr\n")
-    elif mean_change < 0:
-        f.write(f" • Subsidence ACCELERATING (worsening)\n")
-        f.write(f" Early mean of {early_rates.mean():.2f} mm/yr increasing to {late_rates.mean():.2f} mm/yr\n")
+        f.write("No valid observations in late period.\n\n")
+
+    # Acceleration metrics
+    f.write("=" * 80 + "\n")
+    f.write("ACCELERATION METRICS\n")
+    f.write("=" * 80 + "\n")
+    # FIX #8: guard against empty df_accel
+    if len(df_accel) > 0:
+        for _, row in df_accel.iterrows():
+            f.write(f"\n{row['Metric']}\n")
+            f.write(f"  Early: {row['Early_Period']:.3f} cm/yr\n")
+            f.write(f"  Late:  {row['Late_Period']:.3f} cm/yr\n")
+            f.write(f"  Change: {row['Change_cm_yr']:.3f} cm/yr "
+                    f"({row['Relative_Change_Percent']:.1f}%)\n")
     else:
-        f.write(f" • Subsidence STABLE (no temporal trend)\n")
-    
-    if ci_lower > 0 or ci_upper < 0:
-        f.write(f" • Bootstrap confidence interval does not span zero: significant change detected\n")
+        f.write("\nNo acceleration metrics computed (insufficient data).\n")
+
+    # Interpretation
+    f.write("\n" + "=" * 80 + "\n")
+    f.write("INTERPRETATION\n")
+    f.write("=" * 80 + "\n")
+    if early_stats and late_stats:
+        delta = (late_stats['mean_subsidence_cm_yr']
+                 - early_stats['mean_subsidence_cm_yr'])
+        if delta < 0:
+            f.write("Subsidence is ACCELERATING (more negative in late period).\n")
+        elif delta > 0:
+            f.write("Subsidence is DECELERATING (less negative in late period).\n")
+        else:
+            f.write("No change detected between periods.\n")
+        f.write(f"Late minus early: {delta:.3f} cm/yr\n")
     else:
-        f.write(f" • Bootstrap confidence interval spans zero: marginal significance\n")
+        f.write("Insufficient data in one or both periods for interpretation.\n")
 
-print(f" ✓ temporal_period_statistics.txt")
-
-# ============================================================================
-# GENERATE COMPARISON FIGURES - RESTORED
-# ============================================================================
-
-print(f"\nGenerating comparison figures...")
-
-# Figure 1: Distribution histograms with annotation
-fig, axes = plt.subplots(2, 1, figsize=(12, 10))
-
-# Histogram
-axes[0].hist(
-    early_rates, bins=60, alpha=0.6, color='steelblue',
-    label=f'Early (n={len(early):,})', edgecolor='black', density=True
-)
-axes[0].hist(
-    late_rates, bins=60, alpha=0.6, color='coral',
-    label=f'Late (n={len(late):,})', edgecolor='black', density=True
-)
-axes[0].axvline(early_rates.mean(), color='steelblue', linestyle='--', linewidth=2.5, label='Early mean')
-axes[0].axvline(late_rates.mean(), color='coral', linestyle='--', linewidth=2.5, label='Late mean')
-axes[0].set_title('Subsidence Rate Distribution Comparison', fontsize=14, fontweight='bold')
-axes[0].set_xlabel('Rate (mm/year)', fontsize=12)
-axes[0].set_ylabel('Density', fontsize=12)
-axes[0].legend(fontsize=10, loc='upper right')
-axes[0].grid(True, alpha=0.3)
-
-# Annotation box
-textstr = f'Change: {mean_change:.2f} mm/yr\nVelocity: {change_velocity:.4f} mm/yr/year\np-value: {t_pval:.2e}'
-axes[0].text(0.02, 0.97, textstr, transform=axes[0].transAxes,
-    fontsize=11, verticalalignment='top', horizontalalignment='left',
-    bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
-
-# Boxplot
-data_for_box = [early_rates, late_rates]
-bp = axes[1].boxplot(data_for_box, labels=['Early', 'Late'], patch_artist=True)
-
-for patch, color in zip(bp['boxes'], ['steelblue', 'coral']):
-    patch.set_facecolor(color)
-    patch.set_alpha(0.6)
-
-axes[1].set_ylabel('Subsidence Rate (mm/yr)', fontsize=12)
-axes[1].set_title('Period Comparison - Boxplot', fontsize=14, fontweight='bold')
-axes[1].grid(True, alpha=0.3, axis='y')
-
-# Add significance annotation
-y_max = max(late_rates.max(), early_rates.max()) * 1.1
-axes[1].text(1.5, y_max, f'p={t_pval:.2e}', ha='center', fontsize=11, 
-            bbox=dict(boxstyle='round', facecolor='yellow', alpha=0.5))
-
-plt.tight_layout()
-fig_file = OUTPUT_DIR / '05b_figure_distribution_comparison.png'
-plt.savefig(fig_file, dpi=300, bbox_inches='tight')
-print(f" ✓ Saved: 05b_figure_distribution_comparison.png (300 DPI)")
-
-fig_file_hires = OUTPUT_DIR / '05b_figure_distribution_comparison_HiRes.png'
-plt.savefig(fig_file_hires, dpi=600, bbox_inches='tight')
-print(f" ✓ Saved: 05b_figure_distribution_comparison_HiRes.png (600 DPI)")
-plt.close()
+logger.info(f"Saved {report_file.name}")
+print(f"Saved {report_file.name}")
 
 # ============================================================================
-# COMPLETION
+# 7. FINALIZE METADATA
 # ============================================================================
+print("\n" + "=" * 80)
+print("7. FINALIZING")
+print("=" * 80)
+logger.info("=" * 80)
+logger.info("7. FINALIZING")
+logger.info("=" * 80)
 
-print()
-print("="*80)
-print("SCRIPT 05B COMPLETE - TEMPORAL STRATIFICATION WITH REPORT & FIGURES")
-print("="*80)
-print(f"\n✓ OUTPUTS:")
-print(f" • icesat2_early_period.csv (early period data)")
-print(f" • icesat2_late_period.csv (late period data)")
-print(f" • temporal_acceleration_metrics.csv (all statistics)")
-print(f" • temporal_period_statistics.txt (human-readable report)")
-print(f" • 05b_figure_distribution_comparison.png (publication figure)")
-print(f"\n✓ TEMPORAL STRATIFICATION COMPLETE")
-print(f"Change: {mean_change:.2f} mm/yr, Velocity: {change_velocity:.4f} mm/yr/year")
-print(f"P-value: {t_pval:.2e}, Cohen's d: {cohens_d:.3f}")
-print(f"\nReady for next analysis phase\n")
-print("="*80 + "\n")
+metadata.processing_results = {
+    'early_period_observations': len(df_early),
+    'late_period_observations':  len(df_late),
+    'early_mean_cm_yr':          early_stats['mean_subsidence_cm_yr'] if early_stats else None,
+    'late_mean_cm_yr':           late_stats['mean_subsidence_cm_yr']  if late_stats  else None,
+    'n_acceleration_metrics':    len(df_accel),
+}
 
-sys.exit(0)
+metadata.finalize()
+metadata_file = metadata.save(OUTPUT_DIR)
+logger.info(f"Saved metadata: {metadata_file.name}")
+print(f"Saved metadata: {metadata_file.name}")
+
+# ============================================================================
+# COMPLETION SUMMARY
+# ============================================================================
+print("\n" + "=" * 80)
+print("SCRIPT 05b COMPLETE")
+print("=" * 80)
+logger.info("=" * 80)
+logger.info("SCRIPT 05b COMPLETE")
+logger.info("=" * 80)
+
+print(f"""
+Outputs created:
+  icesat2_early_period.csv             ({len(df_early):,} observations)
+  icesat2_late_period.csv              ({len(df_late):,} observations)
+  temporal_acceleration_metrics.csv    ({len(df_accel)} metrics)
+  05b_temporal_stratification_report.txt
+  script_05b_run.log
+  05b_analysis_temporal_stratification_metadata.json""")
+
+if early_stats and late_stats:
+    accel = (late_stats['mean_subsidence_cm_yr']
+             - early_stats['mean_subsidence_cm_yr'])
+    print(f"""
+Key results:
+  Early period : {early_stats['mean_subsidence_cm_yr']:.3f} cm/yr
+  Late period  : {late_stats['mean_subsidence_cm_yr']:.3f} cm/yr
+  Acceleration : {accel:.3f} cm/yr
+  Sign convention: negative=subsidence, positive=uplift""")
+
+print("\nNext: Run Script 06 (Advanced) or Script 07 (Figures)")
+print("=" * 80 + "\n")
+
+logger.info("SCRIPT 05b EXECUTION COMPLETE")

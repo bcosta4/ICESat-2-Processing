@@ -1,502 +1,530 @@
 """
 ================================================================================
-SCRIPT 06: ADVANCED SPATIAL ANALYSIS WITH UNCERTAINTY QUANTIFICATION
+SCRIPT 06: ADVANCED CLUSTERING & HOTSPOT DETECTION
 ================================================================================
 
-INCLUDES:
-- Memory-optimized KDTree processing (no MemoryError on 2M+ points)
-- LISA hotspot clustering
-- Grid zonal statistics
-- UNCERTAINTY QUANTIFICATION (4 components, RSS combination)
+Purpose
+-------
+Identify subsidence hotspots using spatial clustering:
+1. k-nearest neighbor graph construction
+2. Hotspot detection (threshold-based)
+3. Connected component clustering
+4. Cluster statistics and validation
+5. Coastal integration and filtering
 
-NEW: Uncertainty calculation integrated directly
-  - Measurement uncertainty (quality-dependent)
-  - Temporal sampling uncertainty (reduces with √N)
-  - Datum/reference frame uncertainty
-  - GIA model uncertainty
-  
-Output includes: rate ± uncertainty, 95% CI, confidence class (High/Medium/Low)
+CRITICAL SIGN CONVENTION
+========================
+ALL RATES IN CM/YR:
+  - NEGATIVE (e.g., -2.5) = subsidence ✓ (primary in coastal permafrost)
+  - POSITIVE (e.g., +1.2) = uplift (less common)
 
-================================================================================
+Sign convention is EXPLICITLY VERIFIED at end of script.
+
+Inputs
+------
+- icesat2_repeat_track_matches.csv (Script 03)
+- or 05_subsidence_rates.csv (Script 05)
+- or icesat2_insar_integrated.csv (InSAR integrated)
+
+Outputs
+-------
+- 06_clusters_identified.csv (point-level cluster assignments)
+- 06_cluster_statistics.csv (cluster summary stats, all in cm/yr)
+- 06_coastal_clusters.csv (coastal zone stratification)
+- 06_cluster_map.png (spatial visualization)
+- 06_cluster_stats.png (statistical visualization)
+- 06_analysis_summary.txt (comprehensive report)
+- script_06_run.log (execution log)
+- 06_advanced_analysis_metadata.json (reproducibility)
+
+OUTPUT COLUMN STANDARDIZATION (NEW)
+===================================
+All outputs include standardized columns for compatibility with Script 07:
+  - elevation (elevation in meters, if available)
+  - uncertainty (rate uncertainty in cm/yr, if available)
+  - These enable 07 multipanel figures to work on all datasets
+
+Units: ALL RATES IN CM/YR (negative=subsidence, positive=uplift)
+Sign Convention: VERIFIED ✓
 """
 
 import pandas as pd
 import numpy as np
-from scipy.spatial import cKDTree
+import json
+import logging
 from pathlib import Path
-import warnings
+from datetime import datetime
+from scipy.spatial import cKDTree
+import matplotlib.pyplot as plt
+import argparse
 import sys
+import io
+import warnings
 
 warnings.filterwarnings('ignore')
 
-print("="*80)
-print("SCRIPT 06: ADVANCED SPATIAL ANALYSIS WITH UNCERTAINTY")
-print("="*80)
+# UTF-8 wrapper
+if sys.stdout.encoding != 'utf-8':
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+if sys.stderr.encoding != 'utf-8':
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 
-# ============================================================================
-# CONFIGURATION
-# ============================================================================
-
-BASE_OUTPUT_DIR = Path(r'E:\Processing\ICeSat-2\output_data')
-
-# Memory optimization
-CHUNK_SIZE = 50000
-NEIGHBOR_RADIUS_M = 4.0
-
-# LISA settings
-LISA_RADIUS_M = 100.0
-DENSITY_CLASSES = ['Isolated (0-1)', 'Sparse (1-5)', 'Moderate (5-20)', 'Dense (20+)']
-
-# Grid analysis
-GRID_CELL_SIZE_M = 500.0
-
-# UNCERTAINTY PARAMETERS (mm/yr) - tuned for coastal subsidence
-UNC_MEASUREMENT_MM_YR = 20.0     # ±20 mm/yr baseline
-UNC_DATUM_MM_YR = 10.0           # ±10 mm/yr datum shift
-UNC_GIA_MM_YR = 2.0              # ±2 mm/yr GIA trend
-
-print("\n" + "="*80)
-print("LOADING DATA")
-print("="*80)
-
-# Get run timestamp
 try:
-    with open(BASE_OUTPUT_DIR / 'latest_run_timestamp.txt', 'r') as f:
-        RUN_TIMESTAMP = f.read().strip()
-    OUTPUT_DIR = BASE_OUTPUT_DIR / f'run_{RUN_TIMESTAMP}'
-except FileNotFoundError:
-    print("ERROR: Timestamp file not found. Run Script 00 first.")
-    sys.exit(1)
-
-print(f"\nRun ID: {RUN_TIMESTAMP}")
-print(f"Output directory: {OUTPUT_DIR}\n")
-
-# Load main data
-try:
-    data = pd.read_csv(OUTPUT_DIR / 'density_clusters_all.csv')
-    print(f"✓ Loaded {len(data):,} crossover points")
-except FileNotFoundError:
-    print("ERROR: density_clusters_all.csv not found. Run Script 05b first.")
-    sys.exit(1)
-
-# Load InSAR data (optional)
-insar_data = None
-try:
-    insar_data = pd.read_csv(OUTPUT_DIR / 'icesat2_insar_integrated.csv')
-    print(f"✓ Loaded InSAR data ({len(insar_data):,} points)")
-except FileNotFoundError:
-    print("⚠ InSAR data not found (optional)")
-
-# Detect columns
-print("\nDetecting coordinate system...")
-lat_col = None
-lon_col = None
-rate_col = None
-
-for col in data.columns:
-    if 'lat' in col.lower():
-        lat_col = col
-    if 'lon' in col.lower():
-        lon_col = col
-    if 'subsidence' in col.lower() or 'rate' in col.lower():
-        if 'per_year' in col.lower() or 'mm' in col.lower():
-            rate_col = col
-
-if not all([lat_col, lon_col, rate_col]):
-    print("ERROR: Could not auto-detect required columns")
-    print(f"Available: {list(data.columns)[:10]}")
-    sys.exit(1)
-
-print(f"✓ Using: Latitude={lat_col}, Longitude={lon_col}, Rate={rate_col}")
+    from config import BASEOUTPUTDIR
+except ImportError:
+    BASEOUTPUTDIR = Path(r'E:\Processing\ICeSat-2\output_data')
 
 # ============================================================================
-# SECTION 1: NEIGHBOR COUNTING & DENSITY CLASSIFICATION
+# LOGGING SETUP
 # ============================================================================
-
-print("\n" + "="*80)
-print("SECTION 1: NEIGHBOR COUNTING & DENSITY CLASSIFICATION")
-print("="*80)
-
-# Extract coordinates
-coords = data[[lon_col, lat_col]].values
-n_points = len(coords)
-
-print(f"\nBuilding KDTree for {n_points:,} points...")
-tree = cKDTree(coords)
-print("✓ KDTree built successfully")
-
-# Process in chunks to avoid memory error
-print(f"\nProcessing in chunks of {CHUNK_SIZE:,} points...")
-neighbor_counts = np.zeros(n_points, dtype=int)
-
-for chunk_start in range(0, n_points, CHUNK_SIZE):
-    chunk_end = min(chunk_start + CHUNK_SIZE, n_points)
-    chunk_size = chunk_end - chunk_start
+def setup_logging(output_dir):
+    """Configure logging."""
+    log_file = output_dir / 'script_06_run.log'
+    logger = logging.getLogger('script_06')
+    logger.setLevel(logging.DEBUG)
+    logger.handlers = []
     
-    chunk_coords = coords[chunk_start:chunk_end]
+    fh = logging.FileHandler(log_file, encoding='utf-8', mode='w')
+    fh.setLevel(logging.DEBUG)
+    fh_formatter = logging.Formatter(
+        '%(asctime)s [%(levelname)s] %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    fh.setFormatter(fh_formatter)
+    
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.INFO)
+    ch_formatter = logging.Formatter('%(message)s')
+    ch.setFormatter(ch_formatter)
+    
+    logger.addHandler(fh)
+    logger.addHandler(ch)
+    
+    return logger
+
+# ============================================================================
+# UTILITY: FIND INPUT FILE
+# ============================================================================
+def find_input_file(output_dir):
+    """Find input file with priority order."""
+    priority_files = [
+        output_dir / 'icesat2_repeat_track_matches.csv',    # Script 03 (PRIORITY 1)
+        output_dir / '05_subsidence_rates.csv',              # Script 05 (PRIORITY 2)
+        output_dir / 'icesat2_insar_integrated.csv',         # InSAR-integrated (PRIORITY 3)
+        output_dir / '04_spatial_grid.csv',                  # Script 04 (fallback)
+    ]
+    
+    for filepath in priority_files:
+        if filepath.exists():
+            return filepath
+    
+    print("ERROR: Could not find input file.")
+    print("Searched for:")
+    for f in priority_files:
+        print(f"  - {f.name}")
+    sys.exit(1)
+
+# ============================================================================
+# UTILITY: FIND RATE COLUMN
+# ============================================================================
+def find_rate_column(df):
+    """Prioritize subsidence_rate_cm_per_year."""
+    candidates = [
+        'subsidence_rate_cm_per_year',
+        'subsidence_rate_cm_yr',
+        'rate_cm_yr',
+        'mean_subsidence_cm_yr',
+    ]
+    for col in candidates:
+        if col in df.columns:
+            return col
+    
+    print(f"ERROR: No subsidence rate column found. Columns: {list(df.columns)}")
+    sys.exit(1)
+
+# ============================================================================
+# UTILITY: STANDARDIZE ELEVATION & UNCERTAINTY COLUMNS
+# ============================================================================
+def standardize_columns(df):
+    """
+    Standardize column names for multipanel compatibility.
+    Looks for elevation and uncertainty, renames to standard names.
+    """
+    # Elevation standardization
+    elev_candidates = ['elevation', 'elev', 'elevation_m', 'height_m', 'z']
+    for col in elev_candidates:
+        if col in df.columns and 'elevation' not in df.columns:
+            df['elevation'] = df[col]
+            break
+    
+    # Uncertainty standardization
+    unc_candidates = [
+        'rate_uncertainty_cm_yr', 'uncertainty_cm_yr',
+        'std_error_cm_yr', 'rate_uncertainty_cm_per_year'
+    ]
+    for col in unc_candidates:
+        if col in df.columns and 'uncertainty' not in df.columns:
+            df['uncertainty'] = df[col]
+            break
+    
+    return df
+
+# ============================================================================
+# MAIN CLUSTERING
+# ============================================================================
+def main(threshold=-2.0, radius_km=2.0, min_size=10, k=250):
+    """Main clustering workflow."""
+    
+    print("=" * 80)
+    print("SCRIPT 06: ADVANCED CLUSTERING & HOTSPOT DETECTION")
+    print("=" * 80)
+    
+    # Setup
+    timestamp_file = BASEOUTPUTDIR / 'latest_RUN_TIMESTAMP.txt'
+    if not timestamp_file.exists():
+        print("ERROR: Run Script 00 first")
+        sys.exit(1)
+    
+    with open(timestamp_file, 'r', encoding='utf-8') as f:
+        RUN_TIMESTAMP = f.read().strip()
+    
+    OUTPUT_DIR = BASEOUTPUTDIR / f'run_{RUN_TIMESTAMP}'
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    
+    logger = setup_logging(OUTPUT_DIR)
+    
+    logger.info("=" * 80)
+    logger.info("SCRIPT 06: ADVANCED CLUSTERING")
+    logger.info("=" * 80)
+    logger.info(f"Run ID: {RUN_TIMESTAMP}")
+    
+    print(f"Run ID: {RUN_TIMESTAMP}")
+    print(f"Output: {OUTPUT_DIR}")
+    
+    # ========================================================================
+    # LOAD DATA
+    # ========================================================================
+    logger.info("\n1. LOADING DATA")
+    print("\n" + "=" * 80)
+    print("1. LOADING DATA")
+    print("=" * 80)
+    
+    input_file = find_input_file(OUTPUT_DIR)
+    df = pd.read_csv(input_file)
+    
+    logger.info(f"Loaded {len(df):,} points from {input_file.name}")
+    print(f"✓ Loaded {len(df):,} points")
+    
+    # Standardize columns for multipanel compatibility
+    df = standardize_columns(df)
+    
+    # Find rate column
+    rate_col = find_rate_column(df)
+    logger.info(f"Using rate column: '{rate_col}'")
+    print(f"✓ Using rate column: '{rate_col}'")
+    
+    # Find lat/lon columns
+    lon_col = next((c for c in df.columns if 'lon' in c.lower()), 'lon')
+    lat_col = next((c for c in df.columns if 'lat' in c.lower()), 'lat')
+    
+    if lon_col not in df.columns or lat_col not in df.columns:
+        print(f"ERROR: Could not find lon/lat columns")
+        sys.exit(1)
+    
+    # ========================================================================
+    # k-NEAREST NEIGHBOR GRAPH
+    # ========================================================================
+    logger.info("\n2. k-NEAREST NEIGHBOR GRAPH")
+    print("\n" + "=" * 80)
+    print("2. k-NEAREST NEIGHBOR GRAPH")
+    print("=" * 80)
+    
+    coords = df[[lon_col, lat_col]].values
+    tree = cKDTree(coords)
     
     try:
-        distances, indices = tree.query(chunk_coords, k=min(1000, n_points))
-        
-        if distances.ndim == 1:
-            distances = distances.reshape(1, -1)
-            indices = indices.reshape(1, -1)
-        
-        for i in range(chunk_size):
-            neighbors_in_radius = np.sum(distances[i] <= NEIGHBOR_RADIUS_M) - 1
-            neighbor_counts[chunk_start + i] = max(0, neighbors_in_radius)
-        
-        progress = min(chunk_end, n_points)
-        print(f"  ✓ Processed {progress:,} / {n_points:,} points")
-        
+        distances, indices = tree.query(coords, k=k+1)
     except Exception as e:
-        print(f"  ⚠ Error in chunk {chunk_start}-{chunk_end}: {e}")
-        for idx in range(chunk_start, chunk_end):
-            try:
-                distances = tree.query(coords[idx:idx+1], k=min(500, n_points))[0]
-                if distances.ndim == 0:
-                    distances = np.array([distances])
-                neighbor_counts[idx] = max(0, np.sum(distances <= NEIGHBOR_RADIUS_M) - 1)
-            except:
-                neighbor_counts[idx] = 0
-
-print(f"✓ Neighbor counting complete")
-print(f"  Mean neighbors: {neighbor_counts.mean():.1f}")
-print(f"  Max neighbors: {neighbor_counts.max()}")
-
-data['neighbor_count'] = neighbor_counts
-
-# Classify density
-print("\nClassifying density classes...")
-def classify_density(count):
-    if count == 0 or count == 1:
-        return 'Isolated (0-1)'
-    elif count <= 5:
-        return 'Sparse (1-5)'
-    elif count <= 20:
-        return 'Moderate (5-20)'
-    else:
-        return 'Dense (20+)'
-
-data['density_class'] = data['neighbor_count'].apply(classify_density)
-
-density_counts = data['density_class'].value_counts()
-print("\nDensity class distribution:")
-for dc in DENSITY_CLASSES:
-    count = density_counts.get(dc, 0)
-    pct = 100 * count / len(data)
-    print(f"  {dc:20s}: {count:8,} points ({pct:5.1f}%)")
-
-# ============================================================================
-# SECTION 2: UNCERTAINTY QUANTIFICATION
-# ============================================================================
-
-print("\n" + "="*80)
-print("SECTION 2: UNCERTAINTY QUANTIFICATION")
-print("="*80)
-
-print("\nCalculating uncertainty components...\n")
-
-# Measurement uncertainty (quality-dependent if available)
-if 'quality_ph' in data.columns:
-    quality = data['quality_ph'].values
-    measurement_unc = np.where(
-        quality >= 3,
-        UNC_MEASUREMENT_MM_YR / np.sqrt(2),  # Good quality: ±14 mm/yr
-        UNC_MEASUREMENT_MM_YR * np.sqrt(1.5) # Poor quality: ±25 mm/yr
-    )
-else:
-    measurement_unc = np.full(n_points, UNC_MEASUREMENT_MM_YR)
-
-# Temporal sampling uncertainty (reduces with √N observations)
-if 'num_observations' in data.columns:
-    n_obs = np.maximum(data['num_observations'].values, 1)
-    temporal_unc = UNC_MEASUREMENT_MM_YR / np.sqrt(n_obs)
-else:
-    temporal_unc = np.full(n_points, 15.0)
-
-# Datum/reference frame uncertainty
-datum_unc = np.full(n_points, UNC_DATUM_MM_YR)
-
-# GIA model uncertainty
-gia_unc = np.full(n_points, UNC_GIA_MM_YR)
-
-# Total uncertainty (root sum of squares)
-total_unc = np.sqrt(
-    measurement_unc**2 + 
-    temporal_unc**2 + 
-    datum_unc**2 + 
-    gia_unc**2
-)
-
-# Convert rate to mm/yr if needed
-if data[rate_col].max() < 10:
-    rate_mm_yr = data[rate_col] * 1000
-else:
-    rate_mm_yr = data[rate_col]
-
-# Add uncertainty columns
-data['subsidence_rate_mm_yr'] = rate_mm_yr
-data['uncertainty_mm_yr'] = total_unc
-data['ci_lower_mm_yr'] = rate_mm_yr - 1.96 * total_unc
-data['ci_upper_mm_yr'] = rate_mm_yr + 1.96 * total_unc
-
-# Confidence classification
-unc_low = np.percentile(total_unc, 33)
-unc_high = np.percentile(total_unc, 67)
-
-def confidence_class(unc):
-    if unc <= unc_low:
-        return 'High'
-    elif unc <= unc_high:
-        return 'Medium'
-    else:
-        return 'Low'
-
-data['confidence'] = data['uncertainty_mm_yr'].apply(confidence_class)
-
-# Print statistics
-print(f"✓ Uncertainty quantification complete\n")
-print(f"Uncertainty statistics (mm/yr):")
-print(f"  Measurement uncertainty:  {measurement_unc.mean():6.2f} ± {measurement_unc.std():6.2f}")
-print(f"  Temporal sampling unc:    {temporal_unc.mean():6.2f} ± {temporal_unc.std():6.2f}")
-print(f"  Datum uncertainty:        {datum_unc.mean():6.2f}")
-print(f"  GIA uncertainty:          {gia_unc.mean():6.2f}")
-print(f"  TOTAL uncertainty:        {total_unc.mean():6.2f} ± {total_unc.std():6.2f}")
-
-conf_counts = pd.Series(data['confidence']).value_counts()
-print(f"\nConfidence distribution:")
-for conf in ['High', 'Medium', 'Low']:
-    count = conf_counts.get(conf, 0)
-    pct = 100 * count / len(data)
-    print(f"  {conf:10s}: {count:8,} points ({pct:5.1f}%)")
-
-# Uncertainty budget
-total_unc_sq = total_unc.mean()**2
-print(f"\nUncertainty budget (% contribution):")
-print(f"  Measurement:  {100 * (measurement_unc.mean()**2 / total_unc_sq):6.1f}%")
-print(f"  Temporal:     {100 * (temporal_unc.mean()**2 / total_unc_sq):6.1f}%")
-print(f"  Datum:        {100 * (datum_unc.mean()**2 / total_unc_sq):6.1f}%")
-print(f"  GIA:          {100 * (gia_unc.mean()**2 / total_unc_sq):6.1f}%")
-
-# ============================================================================
-# SECTION 3: LISA CLUSTERING
-# ============================================================================
-
-print("\n" + "="*80)
-print("SECTION 3: LISA HOTSPOT CLUSTERING")
-print("="*80)
-
-print("\nClassifying LISA clusters...")
-data['lisa_cluster'] = 'NS'
-
-# Standardize rates
-mean_rate = data[rate_col].mean()
-std_rate = data[rate_col].std()
-data['z_rate'] = (data[rate_col] - mean_rate) / std_rate
-
-# LISA classification
-for idx in range(n_points):
-    if idx % 100000 == 0:
-        print(f"  Processing {idx:,} / {n_points:,}...")
+        logger.warning(f"k-nearest failed with k={k}: {e}")
+        k = 150
+        distances, indices = tree.query(coords, k=k+1)
     
-    neighbors = tree.query_ball_point(coords[idx:idx+1], r=LISA_RADIUS_M)[0]
+    # Build neighbor list (skip self)
+    neighbors_list = []
+    radius_m = radius_km * 1000.0
+    for i in range(len(coords)):
+        # Filter by radius (convert degrees to meters approximately)
+        dists_m = distances[i, 1:] * 111000.0
+        valid = dists_m <= radius_m
+        neighbors_list.append(indices[i, 1:][valid])
     
-    if len(neighbors) < 2:
-        data.loc[idx, 'lisa_cluster'] = 'NS'
-        continue
+    k_used = np.mean([len(n) for n in neighbors_list])
+    logger.info(f"Avg neighbors per point: {k_used:.1f} (within {radius_km} km)")
+    print(f"✓ k-nearest graph built (avg {k_used:.1f} neighbors)")
     
-    z_focal = data.loc[idx, 'z_rate']
-    z_neighbors = data.loc[neighbors, 'z_rate'].mean()
+    # ========================================================================
+    # HOTSPOT DETECTION
+    # ========================================================================
+    logger.info("\n3. HOTSPOT DETECTION")
+    print("\n" + "=" * 80)
+    print("3. HOTSPOT DETECTION")
+    print("=" * 80)
     
-    if z_focal > 0 and z_neighbors > 0:
-        data.loc[idx, 'lisa_cluster'] = 'HH'
-    elif z_focal < 0 and z_neighbors < 0:
-        data.loc[idx, 'lisa_cluster'] = 'LL'
-    elif z_focal > 0 and z_neighbors < 0:
-        data.loc[idx, 'lisa_cluster'] = 'HL'
-    elif z_focal < 0 and z_neighbors > 0:
-        data.loc[idx, 'lisa_cluster'] = 'LH'
-    else:
-        data.loc[idx, 'lisa_cluster'] = 'NS'
-
-print("✓ LISA classification complete")
-lisa_counts = data['lisa_cluster'].value_counts()
-print("\nLISA cluster distribution:")
-for cluster in ['HH', 'LL', 'HL', 'LH', 'NS']:
-    count = lisa_counts.get(cluster, 0)
-    pct = 100 * count / len(data)
-    label = {
-        'HH': 'Hotspot (High-High)',
-        'LL': 'Cold Spot (Low-Low)',
-        'HL': 'Outlier (High-Low)',
-        'LH': 'Outlier (Low-High)',
-        'NS': 'Not Significant'
-    }
-    print(f"  {label[cluster]:30s}: {count:8,} points ({pct:5.1f}%)")
-
-# ============================================================================
-# SECTION 4: GRID ZONAL STATISTICS
-# ============================================================================
-
-print("\n" + "="*80)
-print("SECTION 4: GRID ZONAL STATISTICS WITH UNCERTAINTY")
-print("="*80)
-
-print(f"\nAggregating to {GRID_CELL_SIZE_M:.0f}m grid cells...")
-
-# Create grid
-lon_min, lon_max = data[lon_col].min(), data[lon_col].max()
-lat_min, lat_max = data[lat_col].min(), data[lat_col].max()
-
-lon_range_m = (lon_max - lon_min) * 111000
-lat_range_m = (lat_max - lat_min) * 111000
-
-n_lon_cells = int(np.ceil(lon_range_m / GRID_CELL_SIZE_M))
-n_lat_cells = int(np.ceil(lat_range_m / GRID_CELL_SIZE_M))
-
-# Assign grid cells
-data['grid_lon'] = np.floor((data[lon_col] - lon_min) / ((lon_max - lon_min) / n_lon_cells)).astype(int)
-data['grid_lat'] = np.floor((data[lat_col] - lat_min) / ((lat_max - lat_min) / n_lat_cells)).astype(int)
-
-# Compute grid statistics including uncertainty
-grid_stats = []
-
-for (grid_lon, grid_lat), group in data.groupby(['grid_lon', 'grid_lat']):
-    n_pts = len(group)
+    subsidence_rates = df[rate_col].values
+    hotspot_mask = subsidence_rates <= threshold
+    n_hotspots = hotspot_mask.sum()
     
-    # Rate statistics
-    mean_rate = group[rate_col].mean()
-    std_rate = group[rate_col].std()
+    logger.info(f"Hotspots: {n_hotspots:,} (threshold: {threshold} cm/yr)")
+    print(f"✓ Hotspots: {n_hotspots:,} ({n_hotspots/len(df)*100:.1f}%)")
+    print(f"  Threshold: {threshold} cm/yr (more negative = stronger subsidence)")
     
-    # Uncertainty in grid (combines component + spatial)
-    mean_unc = group['uncertainty_mm_yr'].mean()
-    # Spatial heterogeneity = std of point values minus measurement error
-    spatial_unc = np.sqrt(np.maximum(std_rate**2 - (mean_unc/1000)**2, 0))
-    total_grid_unc = np.sqrt((mean_unc**2) + (spatial_unc * 1000)**2)
+    # ========================================================================
+    # CONNECTED CLUSTERING (BFS)
+    # ========================================================================
+    logger.info("\n4. CLUSTER IDENTIFICATION (BFS)")
+    print("\n4. CLUSTER IDENTIFICATION")
     
-    grid_stats.append({
-        'grid_lon': grid_lon,
-        'grid_lat': grid_lat,
-        'lon_center': lon_min + (grid_lon + 0.5) * (lon_max - lon_min) / n_lon_cells,
-        'lat_center': lat_min + (grid_lat + 0.5) * (lat_max - lat_min) / n_lat_cells,
-        'n_points': n_pts,
-        'mean_rate_mm_yr': mean_rate * 1000 if mean_rate < 10 else mean_rate,
-        'std_rate_mm_yr': std_rate * 1000 if std_rate < 10 else std_rate,
-        'uncertainty_mm_yr': total_grid_unc,
-        'relative_unc_pct': 100 * total_grid_unc / np.abs(mean_rate * 1000) if mean_rate != 0 else np.nan,
-        'ci_lower_mm_yr': (mean_rate * 1000 if mean_rate < 10 else mean_rate) - 1.96 * total_grid_unc,
-        'ci_upper_mm_yr': (mean_rate * 1000 if mean_rate < 10 else mean_rate) + 1.96 * total_grid_unc,
-    })
-
-grid_stats_df = pd.DataFrame(grid_stats)
-
-print(f"✓ Created {len(grid_stats_df):,} grid cells")
-print(f"  Grid dimensions: {n_lon_cells} × {n_lat_cells} cells")
-print(f"\nGrid uncertainty statistics:")
-print(f"  Mean uncertainty:       {grid_stats_df['uncertainty_mm_yr'].mean():6.2f} mm/yr")
-print(f"  Mean relative unc:      {grid_stats_df['relative_unc_pct'].mean():6.1f}%")
-print(f"  High reliability zones: {len(grid_stats_df[grid_stats_df['relative_unc_pct']<30]):,} cells (<30%)")
-print(f"  Low reliability zones:  {len(grid_stats_df[grid_stats_df['relative_unc_pct']>100]):,} cells (>100%)")
-
-# ============================================================================
-# SAVE OUTPUTS
-# ============================================================================
-
-print("\n" + "="*80)
-print("SAVING OUTPUTS")
-print("="*80)
-
-# Save data with uncertainty
-output_file = OUTPUT_DIR / 'density_clusters_all.csv'
-data.to_csv(output_file, index=False)
-print(f"✓ Saved: {output_file.name}")
-print(f"  Columns include: confidence, uncertainty_mm_yr, ci_lower_mm_yr, ci_upper_mm_yr")
-
-# Save grid statistics
-grid_file = OUTPUT_DIR / '06_grid_zonal_statistics.csv'
-grid_stats_df.to_csv(grid_file, index=False)
-print(f"✓ Saved: {grid_file.name}")
-print(f"  Columns include: uncertainty_mm_yr, relative_unc_pct, ci_lower/upper_mm_yr")
-
-# Summary report
-summary_text = f"""
-================================================================================
-SCRIPT 06: ADVANCED ANALYSIS WITH UNCERTAINTY - SUMMARY
-================================================================================
-
-Generated: {pd.Timestamp.now()}
-Run ID: {RUN_TIMESTAMP}
-
-DATASET OVERVIEW:
-  Total points: {len(data):,}
-  Coordinates: {lat_col}, {lon_col}
-  Rate column: {rate_col}
-
-UNCERTAINTY QUANTIFICATION:
-  Components: Measurement, Temporal, Datum, GIA (RSS combined)
-  Mean total uncertainty: {total_unc.mean():.2f} ± {total_unc.std():.2f} mm/yr
-  
-  Confidence distribution:
-    High:     {len(data[data['confidence']=='High']):8,} ({100*len(data[data['confidence']=='High'])/len(data):5.1f}%)
-    Medium:   {len(data[data['confidence']=='Medium']):8,} ({100*len(data[data['confidence']=='Medium'])/len(data):5.1f}%)
-    Low:      {len(data[data['confidence']=='Low']):8,} ({100*len(data[data['confidence']=='Low'])/len(data):5.1f}%)
-
-SPATIAL ANALYSIS:
-  Density classes:
-    Isolated:  {len(data[data['density_class']=='Isolated (0-1)']):8,}
-    Sparse:    {len(data[data['density_class']=='Sparse (1-5)']):8,}
-    Moderate:  {len(data[data['density_class']=='Moderate (5-20)']):8,}
-    Dense:     {len(data[data['density_class']=='Dense (20+)']):8,}
+    cluster_id = np.full(len(df), -1, dtype=int)
+    current_cluster = 0
     
-  LISA clusters:
-    Hotspots (HH):     {len(data[data['lisa_cluster']=='HH']):8,}
-    Cold spots (LL):   {len(data[data['lisa_cluster']=='LL']):8,}
-    Outliers (HL/LH):  {len(data[(data['lisa_cluster']=='HL') | (data['lisa_cluster']=='LH')]):8,}
-    Not significant:   {len(data[data['lisa_cluster']=='NS']):8,}
+    for i in range(len(df)):
+        if not hotspot_mask[i] or cluster_id[i] != -1:
+            continue
+        
+        # BFS
+        queue = [i]
+        cluster_id[i] = current_cluster
+        queue_idx = 0
+        
+        while queue_idx < len(queue):
+            point = queue[queue_idx]
+            queue_idx += 1
+            
+            for neighbor in neighbors_list[point]:
+                if hotspot_mask[neighbor] and cluster_id[neighbor] == -1:
+                    cluster_id[neighbor] = current_cluster
+                    queue.append(neighbor)
+        
+        current_cluster += 1
+    
+    n_clusters = current_cluster
+    logger.info(f"Raw clusters: {n_clusters}")
+    print(f"✓ Raw clusters: {n_clusters}")
+    
+    # ========================================================================
+    # CLUSTER STATISTICS & FILTERING
+    # ========================================================================
+    logger.info("\n5. CLUSTER STATISTICS")
+    print("\n5. CLUSTER STATISTICS")
+    
+    cluster_stats = []
+    
+    for cid in range(n_clusters):
+        cluster_mask = cluster_id == cid
+        cluster_points = np.where(cluster_mask)[0]
+        
+        if len(cluster_points) >= min_size:
+            cluster_rates = subsidence_rates[cluster_points]
+            cluster_lats = df.iloc[cluster_points][lat_col].values
+            cluster_lons = df.iloc[cluster_points][lon_col].values
+            
+            # Elevation if available
+            cluster_elev = None
+            if 'elevation' in df.columns:
+                cluster_elev_vals = df.iloc[cluster_points]['elevation'].dropna().values
+                if len(cluster_elev_vals) > 0:
+                    cluster_elev = np.mean(cluster_elev_vals)
+            
+            # Uncertainty if available
+            cluster_unc = None
+            if 'uncertainty' in df.columns:
+                cluster_unc_vals = df.iloc[cluster_points]['uncertainty'].dropna().values
+                if len(cluster_unc_vals) > 0:
+                    cluster_unc = np.mean(cluster_unc_vals)
+            
+            stats = {
+                'cluster_id': cid,
+                'size': len(cluster_points),
+                'mean_subsidence_cm_yr': np.mean(cluster_rates),
+                'median_subsidence_cm_yr': np.median(cluster_rates),
+                'std_subsidence_cm_yr': np.std(cluster_rates),
+                'min_subsidence_cm_yr': np.min(cluster_rates),
+                'max_subsidence_cm_yr': np.max(cluster_rates),
+                'center_lat': np.mean(cluster_lats),
+                'center_lon': np.mean(cluster_lons),
+                'extent_km': np.sqrt(
+                    ((np.max(cluster_lons) - np.min(cluster_lons))**2 +
+                     (np.max(cluster_lats) - np.min(cluster_lats))**2) * 111
+                ),
+            }
+            
+            # Standardized columns
+            if cluster_elev is not None:
+                stats['elevation'] = cluster_elev
+            if cluster_unc is not None:
+                stats['uncertainty'] = cluster_unc
+            
+            cluster_stats.append(stats)
+    
+    df_cluster_stats = pd.DataFrame(cluster_stats)
+    n_valid_clusters = len(df_cluster_stats)
+    
+    logger.info(f"Valid clusters (>= {min_size} pts): {n_valid_clusters}")
+    print(f"✓ Valid clusters: {n_valid_clusters}")
+    
+    # ========================================================================
+    # SIGN VERIFICATION (SAME AS SCRIPT 06)
+    # ========================================================================
+    logger.info("\n6. SIGN CONVENTION VERIFICATION")
+    print("\n6. SIGN CONVENTION VERIFICATION")
+    
+    if n_valid_clusters > 0:
+        mean_cluster = df_cluster_stats['mean_subsidence_cm_yr'].mean()
+        
+        if mean_cluster > 0:
+            logger.warning("⚠️  POSITIVE cluster mean! Check rate column.")
+            print("⚠️  WARNING: Positive cluster mean (unexpected)")
+            print(f"   Mean: {mean_cluster:.3f} cm/yr")
+            print(f"   Verify rate column: '{rate_col}'")
+        else:
+            logger.info(f"✓ Sign verified: mean = {mean_cluster:.3f} cm/yr (negative = subsidence)")
+            print(f"✓ Sign verified: {mean_cluster:.3f} cm/yr (negative ✓)")
+    
+    # ========================================================================
+    # COASTAL FILTERING
+    # ========================================================================
+    logger.info("\n7. COASTAL FILTERING")
+    print("\n7. COASTAL FILTERING")
+    
+    coastal_col = next((c for c in df.columns if 'coastal' in c.lower()), None)
+    if coastal_col:
+        df['cluster_id'] = cluster_id
+        coastal_clusters = df[df['cluster_id'] >= 0].groupby('cluster_id')['coastal_zone'].agg([
+            ('n_coastal', lambda x: (x == 'Coastal (0-1 km)').sum()),
+            ('coastal_pct', lambda x: (x == 'Coastal (0-1 km)').mean() * 100)
+        ]).round(1)
+        
+        df_coastal = df_cluster_stats.merge(coastal_clusters, left_on='cluster_id', right_index=True, how='left')
+        df_coastal.fillna(0, inplace=True)
+        df_coastal.to_csv(OUTPUT_DIR / '06_coastal_clusters.csv', index=False)
+        logger.info("Saved coastal cluster stratification")
+        print("✓ Coastal clusters saved")
+    
+    # ========================================================================
+    # SAVE OUTPUTS
+    # ========================================================================
+    logger.info("\n8. SAVING OUTPUTS")
+    print("\n8. SAVING OUTPUTS")
+    
+    df['cluster_id'] = cluster_id
+    output_cols = [lat_col, lon_col, rate_col, 'cluster_id']
+    if 'elevation' in df.columns:
+        output_cols.append('elevation')
+    if 'uncertainty' in df.columns:
+        output_cols.append('uncertainty')
+    
+    df[output_cols].to_csv(OUTPUT_DIR / '06_clusters_identified.csv', index=False)
+    df_cluster_stats.to_csv(OUTPUT_DIR / '06_cluster_statistics.csv', index=False)
+    
+    logger.info("Saved cluster outputs")
+    print("✓ Cluster outputs saved")
+    
+    # ========================================================================
+    # SUMMARY REPORT
+    # ========================================================================
+    logger.info("\n9. GENERATING SUMMARY")
+    print("\n9. GENERATING SUMMARY")
+    
+    summary_file = OUTPUT_DIR / '06_analysis_summary.txt'
+    with open(summary_file, 'w', encoding='utf-8') as f:
+        f.write("=" * 80 + "\n")
+        f.write("SCRIPT 06: ADVANCED CLUSTERING SUMMARY\n")
+        f.write("=" * 80 + "\n\n")
+        f.write(f"Run: {RUN_TIMESTAMP}\n")
+        f.write(f"Parameters: threshold={threshold} cm/yr, radius={radius_km} km, min_size={min_size}\n\n")
+        
+        f.write("CLUSTERING RESULTS\n")
+        f.write("=" * 80 + "\n")
+        f.write(f"Points analyzed: {len(df):,}\n")
+        f.write(f"Hotspots: {n_hotspots:,} ({n_hotspots/len(df)*100:.1f}%)\n")
+        f.write(f"Valid clusters: {n_valid_clusters}\n")
+        
+        if n_valid_clusters > 0:
+            f.write(f"Mean cluster size: {df_cluster_stats['size'].mean():.0f} pts\n")
+            f.write(f"Mean subsidence: {df_cluster_stats['mean_subsidence_cm_yr'].mean():.3f} cm/yr\n")
+        
+        f.write("\nSIGN CONVENTION\n")
+        f.write("=" * 80 + "\n")
+        f.write("Negative cm/yr = subsidence ✓\n")
+        if n_valid_clusters > 0 and mean_cluster <= 0:
+            f.write(f"Mean cluster subsidence: {mean_cluster:.3f} cm/yr ✓ VERIFIED\n")
+    
+    logger.info(f"Saved: {summary_file.name}")
+    print(f"✓ Saved summary report")
+    
+    # ========================================================================
+    # FIGURES
+    # ========================================================================
+    logger.info("\n10. GENERATING FIGURES")
+    print("\n10. GENERATING FIGURES")
+    
+    try:
+        plt.figure(figsize=(12, 10))
+        scatter = plt.scatter(df[lon_col], df[lat_col], c=df['cluster_id'],
+                             cmap='viridis', s=20, alpha=0.7)
+        plt.colorbar(scatter, label='Cluster ID (-1 = non-hotspot)')
+        plt.xlabel('Longitude')
+        plt.ylabel('Latitude')
+        plt.title('Subsidence Hotspot Clusters')
+        plt.savefig(OUTPUT_DIR / '06_cluster_map.png', dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        if n_valid_clusters > 0:
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+            
+            ax1.scatter(df_cluster_stats['size'], df_cluster_stats['mean_subsidence_cm_yr'], s=100)
+            ax1.set_xlabel('Cluster Size (points)')
+            ax1.set_ylabel('Mean Subsidence (cm/yr)')
+            ax1.set_title('Cluster Size vs Subsidence')
+            ax1.grid(True, alpha=0.3)
+            
+            ax2.hist(df_cluster_stats['mean_subsidence_cm_yr'], bins=20, edgecolor='black')
+            ax2.set_xlabel('Mean Subsidence (cm/yr)')
+            ax2.set_ylabel('Frequency')
+            ax2.set_title('Cluster Subsidence Distribution')
+            ax2.grid(True, alpha=0.3)
+            
+            plt.tight_layout()
+            plt.savefig(OUTPUT_DIR / '06_cluster_stats.png', dpi=300, bbox_inches='tight')
+            plt.close()
+        
+        logger.info("Figures saved")
+        print("✓ Figures saved")
+    except Exception as e:
+        logger.warning(f"Figure generation failed: {e}")
+    
+    # ========================================================================
+    # COMPLETION
+    # ========================================================================
+    logger.info("\nSCRIPT 06 COMPLETE")
+    print("\n" + "=" * 80)
+    print("✅ SCRIPT 06 COMPLETE")
+    print("=" * 80)
+    print(f"Hotspots: {n_hotspots:,} | Clusters: {n_valid_clusters}")
+    print(f"Mean subsidence: {mean_cluster:.3f} cm/yr {'✓' if (n_valid_clusters > 0 and mean_cluster <= 0) else '⚠️'}")
+    print(f"Output: {OUTPUT_DIR}")
+    print("=" * 80 + "\n")
 
-GRID ANALYSIS:
-  Grid cell size: {GRID_CELL_SIZE_M:.0f} m
-  Grid dimensions: {n_lon_cells} × {n_lat_cells} cells
-  Non-empty cells: {len(grid_stats_df):,}
-  
-  Grid reliability:
-    High reliability (<30% unc):   {len(grid_stats_df[grid_stats_df['relative_unc_pct']<30]):,} cells
-    Medium reliability (30-100%):  {len(grid_stats_df[(grid_stats_df['relative_unc_pct']>=30) & (grid_stats_df['relative_unc_pct']<=100)]):,} cells
-    Low reliability (>100%):       {len(grid_stats_df[grid_stats_df['relative_unc_pct']>100]):,} cells
-
-UNCERTAINTY BUDGET:
-  Measurement:  {100 * (measurement_unc.mean()**2 / total_unc_sq):6.1f}%
-  Temporal:     {100 * (temporal_unc.mean()**2 / total_unc_sq):6.1f}%
-  Datum:        {100 * (datum_unc.mean()**2 / total_unc_sq):6.1f}%
-  GIA:          {100 * (gia_unc.mean()**2 / total_unc_sq):6.1f}%
-
-USAGE NOTES:
-  - All subsidence rates should be reported as: value ± uncertainty (95% CI)
-  - Use 'confidence' column to filter high-quality data
-  - Grid 'relative_unc_pct' shows reliability (use <50% for claims)
-  - ci_lower/upper_mm_yr provide 95% confidence intervals
-
-================================================================================
-"""
-
-summary_file = OUTPUT_DIR / '06_analysis_summary.txt'
-with open(summary_file, 'w') as f:
-    f.write(summary_text)
-print(f"\n✓ Saved: 06_analysis_summary.txt")
-
-print("\n" + "="*80)
-print("SCRIPT 06 COMPLETE - DATA READY FOR SCRIPT 07")
-print("="*80)
-print("\nKey outputs:")
-print("  density_clusters_all.csv now includes:")
-print("    - subsidence_rate_mm_yr")
-print("    - uncertainty_mm_yr")
-print("    - ci_lower/upper_mm_yr (95% CI)")
-print("    - confidence (High/Medium/Low)")
-print("\n  06_grid_zonal_statistics.csv now includes:")
-print("    - uncertainty_mm_yr")
-print("    - relative_unc_pct (% of rate magnitude)")
-print("    - ci_lower/upper_mm_yr")
-
-sys.exit(0)
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Advanced Clustering')
+    parser.add_argument('--threshold', type=float, default=-2.0,
+                       help='Hotspot threshold cm/yr (negative=subsidence)')
+    parser.add_argument('--radius', type=float, default=2.0,
+                       help='Search radius km')
+    parser.add_argument('--min-size', type=int, default=10,
+                       help='Min cluster size')
+    parser.add_argument('--k', type=int, default=250,
+                       help='Primary k-neighbors')
+    args = parser.parse_args()
+    
+    main(args.threshold, args.radius, args.min_size, args.k)

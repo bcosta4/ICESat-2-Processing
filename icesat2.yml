@@ -1,0 +1,29 @@
+name: icesat2
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - geopandas=1.0.1
+  - pyogrio=0.10.0
+  - fiona=2.0.0
+  - shapely>=2.0
+  - pandas>=2.0
+  - numpy>=1.24
+  - scipy>=1.10
+  - matplotlib>=3.7
+  - pyproj>=3.5
+  - rasterio>=1.3
+  - richdem
+  - h5py
+  - netcdf4
+  - tqdm
+  - openpyxl
+  - seaborn
+  - statsmodels
+  - scikit-learn
+  - ipykernel
+  - jupyterlab
+  - pip
+  - pip:
+    - icepyx

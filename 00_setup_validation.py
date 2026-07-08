@@ -3,31 +3,33 @@ SCRIPT 00: SETUP & VALIDATION WITH CORRECTED AUTO-INCREMENT TIMESTAMP
 Generates daily auto-incrementing run IDs (YYYYMMDD_n1, n2, etc.)
 """
 
-import os
 from pathlib import Path
 from datetime import datetime
 import sys
 import io
 
-if sys.stdout.encoding != 'utf-8':
+# UTF-8 FIX: None-safe check (.encoding can be None on Windows pipes/redirects)
+_stdout_enc = getattr(sys.stdout, 'encoding', None) or ''
+if _stdout_enc.lower() != 'utf-8':
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
-if sys.stderr.encoding != 'utf-8':
+
+_stderr_enc = getattr(sys.stderr, 'encoding', None) or ''
+if _stderr_enc.lower() != 'utf-8':
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 
-print("="*80)
+print("=" * 80)
 print("SCRIPT 00: SETUP & VALIDATION")
-print("="*80)
+print("=" * 80)
 
 # ============================================================================
 # IMPORT CONFIG
 # ============================================================================
-
 try:
     from config import BASEOUTPUTDIR, INPUTDIR, INSARDIR
     print("\n✓ Configuration imported successfully")
     print(f"  BASEOUTPUTDIR: {BASEOUTPUTDIR}")
-    print(f"  INPUTDIR: {INPUTDIR}")
-    print(f"  INSARDIR: {INSARDIR}")
+    print(f"  INPUTDIR:      {INPUTDIR}")
+    print(f"  INSARDIR:      {INSARDIR}")
 except ImportError as e:
     print(f"\n✗ ERROR: Cannot import config.py")
     print(f"  {e}")
@@ -36,55 +38,49 @@ except ImportError as e:
 # ============================================================================
 # VALIDATE DIRECTORIES
 # ============================================================================
-
-print("\n" + "="*80)
+print("\n" + "=" * 80)
 print("VALIDATING DIRECTORIES")
-print("="*80)
+print("=" * 80)
 
-# Create base output directory if needed
 BASEOUTPUTDIR.mkdir(parents=True, exist_ok=True)
 print(f"✓ Base output directory: {BASEOUTPUTDIR}")
 
-# Verify input directory exists
 if not INPUTDIR.exists():
-    print(f"⚠ WARNING: INPUTDIR does not exist: {INPUTDIR}")
-    print(f"  Scripts may fail if no input data available")
+    print(f"⚠  WARNING: INPUTDIR does not exist: {INPUTDIR}")
+    print(f"   Scripts may fail if no input data available")
 else:
     print(f"✓ Input directory: {INPUTDIR}")
 
 if not INSARDIR.exists():
-    print(f"⚠ WARNING: INSARDIR does not exist: {INSARDIR}")
-    print(f"  InSAR integration will be skipped")
+    print(f"⚠  WARNING: INSARDIR does not exist: {INSARDIR}")
+    print(f"   InSAR integration will be skipped")
 else:
     print(f"✓ InSAR directory: {INSARDIR}")
 
 # ============================================================================
-# GENERATE AUTO-INCREMENT RUN ID (YYYYMMDD_nX FORMAT)
+# GENERATE AUTO-INCREMENT RUN ID  (YYYYMMDD_nX FORMAT)
 # ============================================================================
-
 def get_next_run_id(base_dir):
-    """Generate daily auto-incrementing run ID (YYYYMMDD_n1, n2, etc.)
-    
+    """Generate daily auto-incrementing run ID (YYYYMMDD_n1, n2, etc.).
+
     Parameters
     ----------
-    base_dir : Path
-        Base output directory
-    
+    base_dir : Path | str
+        Base output directory.
+
     Returns
     -------
     str
-        Run ID like '20260116_n1'
+        Run ID like '20260116_n1'.
     """
+    base_dir = Path(base_dir)          # defensive cast; does not shadow param scope
     today = datetime.now().strftime('%Y%m%d')
-    base_dir = Path(base_dir)
-    
-    # Find existing run folders for today
+
     existing_runs = list(base_dir.glob(f'run_{today}_n*'))
-    
-    if len(existing_runs) == 0:
+
+    if not existing_runs:
         run_number = 1
     else:
-        # Extract numbers from folder names
         numbers = []
         for folder in existing_runs:
             try:
@@ -93,18 +89,17 @@ def get_next_run_id(base_dir):
             except (ValueError, IndexError):
                 pass
         run_number = max(numbers) + 1 if numbers else 1
-    
-    run_id = f'{today}_n{run_number}'
-    return run_id
 
-print("\n" + "="*80)
+    return f'{today}_n{run_number}'
+
+
+print("\n" + "=" * 80)
 print("GENERATING RUN ID")
-print("="*80)
+print("=" * 80)
 
 run_id = get_next_run_id(BASEOUTPUTDIR)
 print(f"\n✓ Generated run ID: {run_id}")
 
-# Create run output directory
 run_OUTPUTDIR = BASEOUTPUTDIR / f'run_{run_id}'
 run_OUTPUTDIR.mkdir(parents=True, exist_ok=True)
 print(f"✓ Created output directory: {run_OUTPUTDIR}")
@@ -112,7 +107,6 @@ print(f"✓ Created output directory: {run_OUTPUTDIR}")
 # ============================================================================
 # SAVE TIMESTAMP FILE FOR DOWNSTREAM SCRIPTS
 # ============================================================================
-
 timestamp_file = BASEOUTPUTDIR / 'latest_RUN_TIMESTAMP.txt'
 
 try:
@@ -128,14 +122,11 @@ except Exception as e:
 # ============================================================================
 # VALIDATION SUMMARY
 # ============================================================================
-
-print("\n" + "="*80)
+print("\n" + "=" * 80)
 print("VALIDATION COMPLETE")
-print("="*80)
-
+print("=" * 80)
 print(f"\n✓ All checks passed!")
 print(f"✓ Ready for next script (01_filter_photons.py)")
 print(f"✓ Run ID: {run_id}")
 print(f"✓ Output: {run_OUTPUTDIR}")
-
-print("\n" + "="*80 + "\n")
+print("\n" + "=" * 80 + "\n")

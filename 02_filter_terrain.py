@@ -11,13 +11,6 @@ Classify filtered ground photons as land, ocean or lakes using:
 2. Elevation-based refinement (hybrid approach)
 3. Year-by-year temporal tracking
 
-NEW FEATURES:
-- Elevation-based refinement integrated (no separate script needed!)
-- Removes physically impossible elevations
-- Year-by-year classification tracking
-- All-in-one solution
-- UTF-8 ENCODING FIX (NO UNICODE ERRORS!)
-
 METHOD
 ------
 Step 1: Use GIS spatial joins (location-based classification)
@@ -25,9 +18,9 @@ Step 2: Apply elevation thresholds (physics-based refinement)
 Step 3: Track temporal patterns by year
 
 ELEVATION THRESHOLDS APPLIED:
-* LAND: >= -2m MSL (allows GIS uncertainty + subsidence)
-* LAKES: >= -2m MSL (no maximum - lakes occur naturally at all elevations)
-* OCEAN: <= 5m MSL (allows tides ±2m + waves)
+* LAND:  >= -2.0 m MSL (allows GIS uncertainty + subsidence)
+* LAKES: >= -2.0 m MSL (no upper cap for thermokarst lakes)
+* OCEAN: <=  1.5 m MSL (Tuktoyaktuk tidal range ~0.3 m + wave buffer)
 
 INPUTS
 ------
@@ -37,30 +30,36 @@ INPUTS
 
 OUTPUTS
 -------
-- icesat2_filtered_ground_photons_LAND.csv (refined, elevation-verified)
-- icesat2_filtered_ground_photons_LAKES.csv (refined, elevation-verified)
-- icesat2_filtered_ground_photons_OCEAN.csv (refined, elevation-verified)
-- icesat2_terrain_classified.csv (unified dataset with classification column)
+- icesat2_filtered_ground_photons_LAND.csv (elevation-verified)
+- icesat2_filtered_ground_photons_LAKES.csv (elevation-verified)
+- icesat2_filtered_ground_photons_OCEAN.csv (elevation-verified)
+- icesat2_filtered_ground_photons_ORIGINAL.csv (backup of Script 01 output)
+- icesat2_terrain_classified.csv (unified dataset)
 - 02_photon_counts_by_year_class.txt (year-by-year breakdown)
-- 02_refinement_summary.txt (elevation refinement & filtering summary)
+- 02_filtering_summary.txt (elevation filtering log)
+- 02_refinement_summary.txt (full processing summary)
 
-REPRODUCIBILITY NOTE
---------------------
-Lakes are not capped at any maximum elevation to preserve reproducibility.
-Lakes occur naturally at all elevations in the study area and should be
-classified as such without artificial constraints. Only the physically
-impossible lower bound (-2m MSL) is applied.
+CRS NOTE
+--------
+DEFAULT_UTM_EPSG = 3155 -> NAD83(CSRS) / UTM Zone 9N
+This matches the Statistics Canada and NRCan CanVec GIS layers used for
+spatial joins. If your PhoREAL output uses WGS84 UTM Zone 9N (EPSG:32609)
+instead, set DEFAULT_UTM_EPSG = 32609 and the GIS layers will be reprojected
+to match automatically.
 """
+
+import argparse
+import shutil
+import sys
+import io
+from datetime import datetime
+from pathlib import Path
 
 import pandas as pd
 import geopandas as gpd
 from shapely.geometry import Point
-from pathlib import Path
-import sys
-import io
-from datetime import datetime
 
-from config import BASEOUTPUTDIR
+from config import BASEOUTPUTDIR, VALID_PRODUCTS, DEFAULT_PRODUCT
 
 # UTF-8 encoding for Windows
 if sys.stdout.encoding != 'utf-8':
@@ -69,18 +68,47 @@ if sys.stderr.encoding != 'utf-8':
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 
 # ============================================================================
+# CLI ARGUMENTS
+# ============================================================================
+parser = argparse.ArgumentParser(description="ICESat-2 Terrain Classification")
+parser.add_argument(
+    '--product', type=str, choices=VALID_PRODUCTS, default=DEFAULT_PRODUCT,
+    help='ICESat-2 product being processed (for logging/metadata only; '
+         'terrain classification logic is identical across products)'
+)
+args = parser.parse_args()
+PRODUCT = args.product
+
+# ============================================================================
 # CONFIGURATION
 # ============================================================================
-# Canadian Government Data Layers
+
 CANADA_LAND_SHAPEFILE = Path(r'E:\GIS\lpr_000b21a_e\lpr_000b21a_e.shp')
 CANVEC_WATERBODY_SHAPEFILE = Path(r'E:\GIS\canvec_50K_NT_Hydro_shp\waterbody_2_2.shp')
 
-# Elevation thresholds (meters MSL)
-LAND_MIN_ELEV = -2.0  # Delete LAND photons below this
-LAKE_MIN_ELEV = -2.0  # Delete LAKE photons below this
-OCEAN_MAX_ELEV = 5.0  # Delete OCEAN photons above this
+# Elevation thresholds (metres MSL) — violations are DELETED
+LAND_MIN_ELEV = -7.0   # Delete LAND photons below this
+LAKE_MIN_ELEV = -2.0   # Delete LAKE photons below this
+OCEAN_MAX_ELEV = 1.5   # Delete OCEAN photons above this
+# (Tuktoyaktuk tidal range ~0.3 m; 1.5 m gives buffer)
 
-# Verify files exist
+# Default UTM CRS for Tuktoyaktuk Peninsula when column detection fails.
+# EPSG:3155 = NAD83(CSRS) / UTM Zone 9N — matches Statistics Canada &
+# NRCan CanVec layers. Change to 32609 (WGS84 / UTM Zone 9N) if your
+# PhoREAL output uses WGS84; the GIS layers will be reprojected to match.
+DEFAULT_UTM_EPSG = 3155
+
+CHUNK_SIZE = 500_000  # photons per processing chunk
+
+# Height column priority order (first match wins)
+HEIGHT_COL_CANDIDATES = [
+    'Height (m MSL)', 'height', 'Height', 'elevation', 'h_li', 'Terrain Best Fit (m)'
+]
+
+# ============================================================================
+# VALIDATE SHAPEFILES
+# ============================================================================
+
 if not CANADA_LAND_SHAPEFILE.exists():
     print("=" * 80)
     print("ERROR: Statistics Canada land boundary not found!")
@@ -99,15 +127,27 @@ else:
 print("=" * 80, flush=True)
 print("SCRIPT 02: TERRAIN CLASSIFICATION WITH ELEVATION FILTERING", flush=True)
 print("=" * 80, flush=True)
+print(f"Product: {PRODUCT}", flush=True)
 
 # ============================================================================
-# LOAD LATEST RUN
+# READ RUN TIMESTAMP (with existence guard)
 # ============================================================================
+
 timestamp_file = BASEOUTPUTDIR / 'latest_RUN_TIMESTAMP.txt'
-with open(timestamp_file, 'r') as f:
+
+if not timestamp_file.exists():
+    print(f"\n✗ ERROR: Timestamp file not found: {timestamp_file}")
+    print("  Script 00 must run first!")
+    sys.exit(1)
+
+with open(timestamp_file, 'r', encoding='utf-8') as f:
     RUN_TIMESTAMP = f.read().strip()
 
 OUTPUT_DIR = BASEOUTPUTDIR / f'run_{RUN_TIMESTAMP}'
+
+# ============================================================================
+# FILE PATHS
+# ============================================================================
 
 INPUT_FILE = OUTPUT_DIR / 'icesat2_filtered_ground_photons.csv'
 BACKUP_FILE = OUTPUT_DIR / 'icesat2_filtered_ground_photons_ORIGINAL.csv'
@@ -115,12 +155,16 @@ BACKUP_FILE = OUTPUT_DIR / 'icesat2_filtered_ground_photons_ORIGINAL.csv'
 LAND_FILE = OUTPUT_DIR / 'icesat2_filtered_ground_photons_LAND.csv'
 LAKES_FILE = OUTPUT_DIR / 'icesat2_filtered_ground_photons_LAKES.csv'
 OCEAN_FILE = OUTPUT_DIR / 'icesat2_filtered_ground_photons_OCEAN.csv'
-OUTPUT_FILE = INPUT_FILE  # Will be replaced with LAND version
 
 CLASSIFIED_FILE = OUTPUT_DIR / 'icesat2_terrain_classified.csv'
 COUNTS_FILE = OUTPUT_DIR / '02_photon_counts_by_year_class.txt'
 FILTERING_FILE = OUTPUT_DIR / '02_filtering_summary.txt'
 REFINEMENT_FILE = OUTPUT_DIR / '02_refinement_summary.txt'
+
+# NOTE: No OUTPUT_FILE alias to INPUT_FILE. Downstream scripts must read
+# LAND_FILE directly. Writing the LAND data twice (once to LAND_FILE and
+# once back to the original path) is redundant and risks silent data
+# corruption on re-runs.
 
 print(f"Run ID: {RUN_TIMESTAMP}", flush=True)
 print(f"Input file: {INPUT_FILE.name}", flush=True)
@@ -130,9 +174,9 @@ if USE_LAKES:
 
 print("=" * 80, flush=True)
 print(f"\nElevation thresholds (violations are DELETED):")
-print(f" LAND: must be >= {LAND_MIN_ELEV:.1f} m MSL (delete if below)")
-print(f" LAKES: must be >= {LAKE_MIN_ELEV:.1f} m MSL (delete if below)")
-print(f" OCEAN: must be <= {OCEAN_MAX_ELEV:.1f} m MSL (delete if above)\n")
+print(f"  LAND:  must be >= {LAND_MIN_ELEV:.1f} m MSL (delete if below)")
+print(f"  LAKES: must be >= {LAKE_MIN_ELEV:.1f} m MSL (delete if below)")
+print(f"  OCEAN: must be <= {OCEAN_MAX_ELEV:.1f} m MSL (delete if above)\n")
 
 if not INPUT_FILE.exists():
     print(f"ERROR: Input file not found: {INPUT_FILE}", flush=True)
@@ -142,109 +186,196 @@ file_size_mb = INPUT_FILE.stat().st_size / (1024 ** 2)
 print(f"Input file size: {file_size_mb:.1f} MB\n", flush=True)
 
 # ============================================================================
+# PRE-FLIGHT: DETECT ELEVATION COLUMN ONCE (before chunk loop)
+# ============================================================================
+
+print("Pre-flight: detecting columns...", flush=True)
+_header_check = pd.read_csv(INPUT_FILE, nrows=5)
+
+ELEV_COL = None
+for _candidate in HEIGHT_COL_CANDIDATES:
+    if _candidate in _header_check.columns:
+        ELEV_COL = _candidate
+        break
+
+if ELEV_COL is None:
+    print(
+        f"  WARNING: No recognised elevation column found in input.\n"
+        f"  Candidates checked: {HEIGHT_COL_CANDIDATES}\n"
+        f"  Elevation filtering will be SKIPPED - all photons retained.",
+        flush=True
+    )
+else:
+    print(f"  Elevation column: '{ELEV_COL}'", flush=True)
+
+# ============================================================================
+# PRE-FLIGHT: VALIDATE REQUIRED SPATIAL COLUMNS
+# ============================================================================
+
+required_cols = {'UTM Easting (m)', 'UTM Northing (m)'}
+missing_cols = required_cols - set(_header_check.columns)
+if missing_cols:
+    print(f"ERROR: Required column(s) missing from input: {missing_cols}",
+          flush=True)
+    sys.exit(1)
+
+# ============================================================================
 # LOAD CANADIAN BOUNDARY LAYERS
 # ============================================================================
+
 print("=" * 80, flush=True)
 print("LOADING CANADIAN GOVERNMENT DATA LAYERS", flush=True)
 print("=" * 80, flush=True)
 
 print("\n1. Loading Statistics Canada land boundary...", flush=True)
 canada_land = gpd.read_file(CANADA_LAND_SHAPEFILE)
-print(f" Loaded {len(canada_land)} province/territory boundaries", flush=True)
-print(f" CRS: {canada_land.crs}", flush=True)
+print(f"   Loaded {len(canada_land)} province/territory boundaries", flush=True)
+print(f"   CRS: {canada_land.crs}", flush=True)
 
 if USE_LAKES:
     print("\n2. Loading CanVec waterbodies...", flush=True)
     waterbodies = gpd.read_file(CANVEC_WATERBODY_SHAPEFILE)
-    print(f" Loaded {len(waterbodies)} waterbody features", flush=True)
-    print(f" CRS: {waterbodies.crs}", flush=True)
+    print(f"   Loaded {len(waterbodies)} waterbody features", flush=True)
+    print(f"   CRS: {waterbodies.crs}", flush=True)
 
-# Detect UTM zone
-print("\n3. Detecting UTM zone from ICeSat-2 data...", flush=True)
-first_chunk = pd.read_csv(INPUT_FILE, nrows=1000)
-utm_zone = int(first_chunk['UTM Zone'].mode()[0])
-utm_hemisphere = first_chunk['UTM Hemisphere'].mode()[0]
-if utm_hemisphere == 'N':
-    utm_epsg = 32600 + utm_zone
+# ============================================================================
+# DETECT UTM ZONE (with fallback to DEFAULT_UTM_EPSG)
+# ============================================================================
+
+print("\n3. Detecting UTM zone from ICESat-2 data...", flush=True)
+
+utm_epsg = DEFAULT_UTM_EPSG  # safe default; overridden below if columns present
+
+if 'UTM Zone' in _header_check.columns and 'UTM Hemisphere' in _header_check.columns:
+    _sample = pd.read_csv(INPUT_FILE, nrows=1000)
+    try:
+        utm_zone = int(_sample['UTM Zone'].mode()[0])
+        utm_hemisphere = str(_sample['UTM Hemisphere'].mode()[0]).strip().upper()
+        if utm_hemisphere == 'N':
+            utm_epsg = 32600 + utm_zone
+        else:
+            utm_epsg = 32700 + utm_zone
+        print(f"   Detected: UTM Zone {utm_zone}{utm_hemisphere} "
+              f"(EPSG:{utm_epsg})", flush=True)
+        if utm_epsg != DEFAULT_UTM_EPSG:
+            print(f"   NOTE: Detected EPSG:{utm_epsg} differs from default "
+                  f"EPSG:{DEFAULT_UTM_EPSG} (NAD83(CSRS) / UTM Zone 9N).\n"
+                  f"   GIS layers will be reprojected to EPSG:{utm_epsg} "
+                  f"to match photon CRS.", flush=True)
+    except Exception as e:
+        print(f"   WARNING: UTM detection failed ({e}); "
+              f"using default EPSG:{DEFAULT_UTM_EPSG} "
+              f"(NAD83(CSRS) / UTM Zone 9N)", flush=True)
 else:
-    utm_epsg = 32700 + utm_zone
-print(f" Detected: UTM Zone {utm_zone}{utm_hemisphere} (EPSG:{utm_epsg})", flush=True)
+    print(f"   'UTM Zone'/'UTM Hemisphere' columns not found; "
+          f"using default EPSG:{DEFAULT_UTM_EPSG} "
+          f"(NAD83(CSRS) / UTM Zone 9N)", flush=True)
 
-# Reproject
-print("\n4. Reprojecting boundary layers to UTM...", flush=True)
+# ============================================================================
+# REPROJECT BOUNDARY LAYERS TO MATCH PHOTON CRS
+# ============================================================================
+
+print("\n4. Reprojecting boundary layers to match photon CRS...", flush=True)
 canada_land_utm = canada_land.to_crs(epsg=utm_epsg)
-print(f" Canada land boundary reprojected", flush=True)
+print(f"   Canada land boundary -> EPSG:{utm_epsg}", flush=True)
 
 if USE_LAKES:
-    if waterbodies.crs.to_epsg() != utm_epsg:
-        print(f" Reprojecting waterbodies...", flush=True)
+    current_epsg = waterbodies.crs.to_epsg() if waterbodies.crs is not None else None
+    if current_epsg != utm_epsg:
+        print(f"   Reprojecting waterbodies {current_epsg} -> {utm_epsg}...",
+              flush=True)
         waterbodies_utm = waterbodies.to_crs(epsg=utm_epsg)
     else:
         waterbodies_utm = waterbodies
-    print(f" Waterbodies ready", flush=True)
+    print(f"   Waterbodies ready (EPSG:{utm_epsg})", flush=True)
 
 print("\n[OK] All boundary layers ready\n", flush=True)
 
 # ============================================================================
-# PROCESS PHOTONS IN CHUNKS - CLASSIFY AND FILTER (DELETION BEHAVIOUR)
+# BACKUP ORIGINAL FILE (copy, not rename - safe on re-runs)
 # ============================================================================
-print("\n" + "=" * 80, flush=True)
+
+print(f"Backing up original input: {BACKUP_FILE.name}", flush=True)
+shutil.copy2(INPUT_FILE, BACKUP_FILE)
+print(f"  ✓ Backup written: {BACKUP_FILE.name}\n", flush=True)
+
+# ============================================================================
+# PROCESS PHOTONS IN CHUNKS
+# ============================================================================
+
+print("=" * 80, flush=True)
 print("CLASSIFYING PHOTONS: LAND / LAKES / OCEAN", flush=True)
 print("=" * 80, flush=True)
-print("Processing in chunks (this may take 10-20 minutes)...\n", flush=True)
-
-chunk_size = 500000  # 500k rows per chunk
+print(f"Processing in chunks of {CHUNK_SIZE:,} "
+      f"(this may take 10-20 minutes)...\n", flush=True)
 
 land_chunks = []
 lakes_chunks = []
 ocean_chunks = []
 
 total_input = 0
-total_processed = 0
 chunk_num = 0
+elev_col_absent_chunks = 0  # chunks where elevation column was absent after sjoin
 
 deleted_photons = {
     'LAND_below_threshold': 0,
     'LAKE_below_threshold': 0,
-    'OCEAN_above_threshold': 0
+    'OCEAN_above_threshold': 0,
 }
 
-for chunk in pd.read_csv(INPUT_FILE, chunksize=chunk_size):
+for chunk in pd.read_csv(INPUT_FILE, chunksize=CHUNK_SIZE):
     chunk_num += 1
     total_input += len(chunk)
 
-    print(f"Chunk {chunk_num}: Processing {len(chunk):,} photons... ", end='', flush=True)
+    print(f"Chunk {chunk_num}: {len(chunk):,} photons ... ", end='', flush=True)
 
-    # Create GeoDataFrame using UTM coordinates
-    geometry = [Point(easting, northing) for easting, northing in zip(
-        chunk['UTM Easting (m)'],
-        chunk['UTM Northing (m)']
-    )]
-    gdf_chunk = gpd.GeoDataFrame(
-        chunk,
-        geometry=geometry,
-        crs=f'EPSG:{utm_epsg}'
-    )
+    # ------------------------------------------------------------------
+    # Build GeoDataFrame from UTM coordinates
+    # ------------------------------------------------------------------
+    geometry = [
+        Point(e, n)
+        for e, n in zip(chunk['UTM Easting (m)'], chunk['UTM Northing (m)'])
+    ]
+    gdf_chunk = gpd.GeoDataFrame(chunk, geometry=geometry,
+                                 crs=f'EPSG:{utm_epsg}')
 
-    # STEP 1: Identify points within Canada land boundary
+    # ------------------------------------------------------------------
+    # STEP 1: Classify land vs. ocean via Canada boundary sjoin
+    # Only pass geometry column to avoid attribute name conflicts.
+    # Deduplicate after join: a point on a province boundary may
+    # match >1 polygon, producing duplicate rows.
+    # ------------------------------------------------------------------
     gdf_with_land = gpd.sjoin(
         gdf_chunk,
-        canada_land_utm,
+        canada_land_utm[['geometry']],
         how='left',
-        predicate='within'
+        predicate='within',
     )
+    gdf_with_land = gdf_with_land[
+        ~gdf_with_land.index.duplicated(keep='first')
+    ]
 
     on_land_mask = gdf_with_land['index_right'].notna()
 
-    # STEP 2: If using lakes, separate land from inland water
+    # ------------------------------------------------------------------
+    # STEP 2: Separate land from lakes (if CanVec available)
+    # ------------------------------------------------------------------
     if USE_LAKES:
-        gdf_land_candidates = gdf_with_land[on_land_mask].copy()
-        gdf_with_lakes = gpd.sjoin(
-            gdf_land_candidates.drop(columns=['index_right']),
-            waterbodies_utm,
-            how='left',
-            predicate='within'
+        gdf_land_candidates = (
+            gdf_with_land[on_land_mask]
+            .drop(columns=['index_right'])
+            .copy()
         )
+        gdf_with_lakes = gpd.sjoin(
+            gdf_land_candidates,
+            waterbodies_utm[['geometry']],
+            how='left',
+            predicate='within',
+        )
+        # Deduplicate lake join (point may overlap multiple lake polygons)
+        gdf_with_lakes = gdf_with_lakes[
+            ~gdf_with_lakes.index.duplicated(keep='first')
+        ]
 
         in_lake_mask = gdf_with_lakes['index_right'].notna()
         gdf_lakes = gdf_with_lakes[in_lake_mask].copy()
@@ -252,70 +383,59 @@ for chunk in pd.read_csv(INPUT_FILE, chunksize=chunk_size):
         gdf_ocean = gdf_with_land[~on_land_mask].copy()
     else:
         gdf_land = gdf_with_land[on_land_mask].copy()
-        gdf_lakes = pd.DataFrame()
+        gdf_lakes = gpd.GeoDataFrame()
         gdf_ocean = gdf_with_land[~on_land_mask].copy()
 
-    # Clean up join artifacts
-    for df in [gdf_land, gdf_lakes, gdf_ocean]:
-        if len(df) > 0 and 'index_right' in df.columns:
-            df.drop(columns=['index_right'], inplace=True)
+    # ------------------------------------------------------------------
+    # Convert GeoDataFrames to plain DataFrames (drop geometry + artifacts)
+    # ------------------------------------------------------------------
+    def _to_df(gdf: gpd.GeoDataFrame) -> pd.DataFrame:
+        """Drop geometry and sjoin index columns; return plain DataFrame."""
+        if not isinstance(gdf, gpd.GeoDataFrame) or len(gdf) == 0:
+            return pd.DataFrame()
+        cols_to_drop = [c for c in ['geometry', 'index_right']
+                        if c in gdf.columns]
+        return pd.DataFrame(gdf.drop(columns=cols_to_drop))
 
-    # Remove geometry and convert
-    df_land = pd.DataFrame(gdf_land.drop(columns=['geometry'])) if len(gdf_land) > 0 else pd.DataFrame()
-    df_lakes = pd.DataFrame(gdf_lakes.drop(columns=['geometry'])) if len(gdf_lakes) > 0 else pd.DataFrame()
-    df_ocean = pd.DataFrame(gdf_ocean.drop(columns=['geometry'])) if len(gdf_ocean) > 0 else pd.DataFrame()
+    df_land = _to_df(gdf_land)
+    df_lakes = _to_df(gdf_lakes)
+    df_ocean = _to_df(gdf_ocean)
 
-    # Apply elevation filters (DELETION, not reclassification)
-    # Elevation column detection for this chunk
-    elev_col = None
-    for col in ['Height (m MSL)', 'height', 'Height', 'elevation', 'h_li']:
-        if col in chunk.columns:
-            elev_col = col
-            break
-
-    if elev_col is None:
-        # No elevation column found; keep everything as-is
+    # ------------------------------------------------------------------
+    # STEP 3: Elevation filtering (using pre-detected ELEV_COL)
+    # ------------------------------------------------------------------
+    if ELEV_COL is None:
+        # No elevation column - retain everything, skip counters
         land_keep = df_land
         lakes_keep = df_lakes
         ocean_keep = df_ocean
-
-        land_del = 0
-        lake_del = 0
-        ocean_del = 0
+        elev_col_absent_chunks += 1
     else:
-        # LAND: delete where below threshold
-        if len(df_land) > 0:
-            land_mask = df_land[elev_col] < LAND_MIN_ELEV
-            land_del = int(land_mask.sum())
-            land_keep = df_land[~land_mask].copy()
+        # LAND: delete below threshold
+        if len(df_land) > 0 and ELEV_COL in df_land.columns:
+            mask = df_land[ELEV_COL] < LAND_MIN_ELEV
+            deleted_photons['LAND_below_threshold'] += int(mask.sum())
+            land_keep = df_land[~mask].copy()
         else:
             land_keep = df_land
-            land_del = 0
 
-        # LAKES: delete where below threshold
-        if len(df_lakes) > 0:
-            lake_mask = df_lakes[elev_col] < LAKE_MIN_ELEV
-            lake_del = int(lake_mask.sum())
-            lakes_keep = df_lakes[~lake_mask].copy()
+        # LAKES: delete below threshold
+        if len(df_lakes) > 0 and ELEV_COL in df_lakes.columns:
+            mask = df_lakes[ELEV_COL] < LAKE_MIN_ELEV
+            deleted_photons['LAKE_below_threshold'] += int(mask.sum())
+            lakes_keep = df_lakes[~mask].copy()
         else:
             lakes_keep = df_lakes
-            lake_del = 0
 
-        # OCEAN: delete where above threshold
-        if len(df_ocean) > 0:
-            ocean_mask = df_ocean[elev_col] > OCEAN_MAX_ELEV
-            ocean_del = int(ocean_mask.sum())
-            ocean_keep = df_ocean[~ocean_mask].copy()
+        # OCEAN: delete above threshold
+        if len(df_ocean) > 0 and ELEV_COL in df_ocean.columns:
+            mask = df_ocean[ELEV_COL] > OCEAN_MAX_ELEV
+            deleted_photons['OCEAN_above_threshold'] += int(mask.sum())
+            ocean_keep = df_ocean[~mask].copy()
         else:
             ocean_keep = df_ocean
-            ocean_del = 0
 
-        # Update global deletion counters
-        deleted_photons['LAND_below_threshold'] += land_del
-        deleted_photons['LAKE_below_threshold'] += lake_del
-        deleted_photons['OCEAN_above_threshold'] += ocean_del
-
-    # Append retained to global collections
+    # Collect retained chunks
     if len(land_keep) > 0:
         land_chunks.append(land_keep)
     if len(lakes_keep) > 0:
@@ -323,26 +443,20 @@ for chunk in pd.read_csv(INPUT_FILE, chunksize=chunk_size):
     if len(ocean_keep) > 0:
         ocean_chunks.append(ocean_keep)
 
-    # Progress message in 46 style
-    pct_land = len(land_keep) / len(chunk) * 100 if len(chunk) > 0 else 0
-    pct_lakes = len(lakes_keep) / len(chunk) * 100 if len(chunk) > 0 else 0
-    pct_ocean = len(ocean_keep) / len(chunk) * 100 if len(chunk) > 0 else 0
-
+    # Progress line
+    n = len(chunk)
+    pct = lambda k: f"{len(k):,} ({100*len(k)/n:.1f}%)" if n > 0 else "0"
     if USE_LAKES:
-        print(
-            f"Land: {len(land_keep):,} ({pct_land:.1f}%), "
-            f"Lakes: {len(lakes_keep):,} ({pct_lakes:.1f}%), "
-            f"Ocean: {len(ocean_keep):,} ({pct_ocean:.1f}%)",
-            flush=True
-        )
+        print(f"Land: {pct(land_keep)}, "
+              f"Lakes: {pct(lakes_keep)}, "
+              f"Ocean: {pct(ocean_keep)}", flush=True)
     else:
-        print(
-            f"Land: {len(land_keep):,} ({pct_land:.1f}%), "
-            f"Ocean: {len(ocean_keep):,} ({pct_ocean:.1f}%)",
-            flush=True
-        )
+        print(f"Land: {pct(land_keep)}, "
+              f"Ocean: {pct(ocean_keep)}", flush=True)
 
-    total_processed += len(chunk)
+# ============================================================================
+# COMBINE RESULTS
+# ============================================================================
 
 print("\n" + "=" * 80, flush=True)
 print("COMBINING RESULTS", flush=True)
@@ -351,13 +465,19 @@ print("=" * 80, flush=True)
 print("\nCombining land chunks...", flush=True)
 df_land_only = pd.concat(land_chunks, ignore_index=True) if land_chunks else pd.DataFrame()
 print("Combining lakes chunks...", flush=True)
-df_lakes_only = pd.concat(lakes_chunks, ignore_index=True) if (USE_LAKES and lakes_chunks) else pd.DataFrame()
+df_lakes_only = pd.concat(lakes_chunks, ignore_index=True) if lakes_chunks else pd.DataFrame()
 print("Combining ocean chunks...", flush=True)
 df_ocean_only = pd.concat(ocean_chunks, ignore_index=True) if ocean_chunks else pd.DataFrame()
 
+total_land = len(df_land_only)
+total_lakes = len(df_lakes_only)
+total_ocean = len(df_ocean_only)
+total_output = total_land + total_lakes + total_ocean
+
 # ============================================================================
-# ELEVATION FILTERING SUMMARY (DELETION) + BASIC STATS
+# ELEVATION FILTERING SUMMARY
 # ============================================================================
+
 print("\n" + "=" * 80, flush=True)
 print("ELEVATION FILTERING SUMMARY", flush=True)
 print("=" * 80, flush=True)
@@ -366,128 +486,135 @@ total_deleted = sum(deleted_photons.values())
 pct_deleted = 100.0 * total_deleted / total_input if total_input > 0 else 0.0
 
 print(f"\nTotal input photons: {total_input:,}", flush=True)
-print(f"Total output photons after filtering: {len(df_land_only) + len(df_lakes_only) + len(df_ocean_only):,}", flush=True)
-print(f"Total DELETED (failed elevation check): {total_deleted:,} ({pct_deleted:.2f}%)", flush=True)
-
+print(f"Total output photons (retained): {total_output:,}", flush=True)
+print(f"Total DELETED (elevation filter): {total_deleted:,} ({pct_deleted:.2f}%)",
+      flush=True)
 print(f"\nDeletions by category:", flush=True)
-print(f" LAND photons below {LAND_MIN_ELEV:.1f} m: {deleted_photons['LAND_below_threshold']:,}", flush=True)
-print(f" LAKE photons below {LAKE_MIN_ELEV:.1f} m: {deleted_photons['LAKE_below_threshold']:,}", flush=True)
-print(f" OCEAN photons above {OCEAN_MAX_ELEV:.1f} m: {deleted_photons['OCEAN_above_threshold']:,}", flush=True)
+print(f"  LAND below {LAND_MIN_ELEV:.1f} m: "
+      f"{deleted_photons['LAND_below_threshold']:,}", flush=True)
+print(f"  LAKE below {LAKE_MIN_ELEV:.1f} m: "
+      f"{deleted_photons['LAKE_below_threshold']:,}", flush=True)
+print(f"  OCEAN above {OCEAN_MAX_ELEV:.1f} m: "
+      f"{deleted_photons['OCEAN_above_threshold']:,}", flush=True)
 
-# Save to FILTERING_FILE, preserving 45's style
-with open(FILTERING_FILE, 'w', encoding='utf-8') as f:
-    f.write("=" * 80 + "\n")
-    f.write("ELEVATION FILTERING SUMMARY\n")
-    f.write("=" * 80 + "\n\n")
-    f.write(f"Run ID: {RUN_TIMESTAMP}\n")
-    f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
-    f.write("ELEVATION THRESHOLDS:\n")
-    f.write(f" LAND: must be >= {LAND_MIN_ELEV}m MSL\n")
-    f.write(f" LAKES: must be >= {LAKE_MIN_ELEV}m MSL\n")
-    f.write(f" OCEAN: must be <= {OCEAN_MAX_ELEV}m MSL\n\n")
-    f.write(f"Total photons processed: {total_input:,}\n")
-    f.write(f"Total photons DELETED: {total_deleted:,} ({pct_deleted:.2f}%)\n\n")
-    f.write("Deletions by category:\n")
-    f.write(f" LAND below {LAND_MIN_ELEV}m: {deleted_photons['LAND_below_threshold']:,}\n")
-    f.write(f" LAKE below {LAKE_MIN_ELEV}m: {deleted_photons['LAKE_below_threshold']:,}\n")
-    f.write(f" OCEAN above {OCEAN_MAX_ELEV}m: {deleted_photons['OCEAN_above_threshold']:,}\n\n")
-    f.write("Retained photons:\n")
-    f.write(f" LAND: {len(df_land_only):,}\n")
-    f.write(f" LAKES: {len(df_lakes_only):,}\n")
-    f.write(f" OCEAN: {len(df_ocean_only):,}\n")
-    f.write(f" TOTAL: {len(df_land_only) + len(df_lakes_only) + len(df_ocean_only):,}\n")
+if ELEV_COL is None:
+    print("\nWARNING: Elevation column not found - "
+          "deletion counters are all zero (no filtering applied).", flush=True)
+elif elev_col_absent_chunks > 0:
+    print(f"\nWARNING: {elev_col_absent_chunks} chunk(s) had no elevation "
+          "column after sjoin - conservation check may be incomplete.",
+          flush=True)
 
-print(f"\n✓ Filtering summary saved to {FILTERING_FILE.name}", flush=True)
+conservation_total = total_output + total_deleted
+print(f"\n✓ Conservation check: "
+      f"{total_input:,} input -> "
+      f"{total_output:,} retained + {total_deleted:,} deleted = "
+      f"{conservation_total:,}", flush=True)
+if conservation_total != total_input:
+    print(f"  ⚠ Mismatch of {abs(conservation_total - total_input):,} photons "
+          "(likely from sjoin deduplication of boundary-overlapping points)",
+          flush=True)
 
 # ============================================================================
-# FINAL CLASSIFICATION SUMMARY (46-style, but with deletion)
+# ELEVATION STATS PER CLASS
 # ============================================================================
+
 print("\n" + "=" * 80, flush=True)
 print("FINAL CLASSIFICATION SUMMARY (AFTER FILTERING)", flush=True)
 print("=" * 80 + "\n", flush=True)
-
-total_land = len(df_land_only)
-total_lakes = len(df_lakes_only)
-total_ocean = len(df_ocean_only)
-total_output = total_land + total_lakes + total_ocean
 
 print(f"Total input photons: {total_input:,}", flush=True)
 print(f"Total output photons: {total_output:,}\n", flush=True)
 
 if total_output > 0:
-    print(f"LAND photons: {total_land:>10,} ({100 * total_land / total_output:.2f}%)", flush=True)
-    print(f"LAKES photons: {total_lakes:>10,} ({100 * total_lakes / total_output:.2f}%)", flush=True)
-    print(f"OCEAN photons: {total_ocean:>10,} ({100 * total_ocean / total_output:.2f}%)", flush=True)
+    print(f"  LAND photons:  {total_land:>10,} ({100*total_land/total_output:.2f}%)",
+          flush=True)
+    print(f"  LAKE photons:  {total_lakes:>10,} ({100*total_lakes/total_output:.2f}%)",
+          flush=True)
+    print(f"  OCEAN photons: {total_ocean:>10,} ({100*total_ocean/total_output:.2f}%)",
+          flush=True)
 
-# Elevation stats if possible
-elev_col_global = None
-for col in ['Height (m MSL)', 'height', 'Height', 'elevation', 'h_li']:
-    if col in df_land_only.columns or col in df_lakes_only.columns or col in df_ocean_only.columns:
-        elev_col_global = col
-        break
 
-if elev_col_global is not None:
-    if total_land > 0:
-        print(f"\nLAND elevation range: {df_land_only[elev_col_global].min():.2f} to {df_land_only[elev_col_global].max():.2f} m", flush=True)
-        print(f"LAND mean: {df_land_only[elev_col_global].mean():.2f} m", flush=True)
-    if total_lakes > 0:
-        print(f"\nLAKES elevation range: {df_lakes_only[elev_col_global].min():.2f} to {df_lakes_only[elev_col_global].max():.2f} m", flush=True)
-        print(f"LAKES mean: {df_lakes_only[elev_col_global].mean():.2f} m", flush=True)
-    if total_ocean > 0:
-        print(f"\nOCEAN elevation range: {df_ocean_only[elev_col_global].min():.2f} to {df_ocean_only[elev_col_global].max():.2f} m", flush=True)
-        print(f"OCEAN mean: {df_ocean_only[elev_col_global].mean():.2f} m", flush=True)
+def _elev_stats(df: pd.DataFrame, label: str) -> None:
+    """Print elevation range and mean for a classified DataFrame."""
+    if len(df) == 0:
+        return
+    col = next((c for c in HEIGHT_COL_CANDIDATES if c in df.columns), None)
+    if col is None:
+        return
+    print(f"\n  {label} elevation range: "
+          f"{df[col].min():.2f} to {df[col].max():.2f} m "
+          f"(mean: {df[col].mean():.2f} m)", flush=True)
 
-print(f"\n✓ Conservation check: {total_input:,} -> {total_output + total_deleted:,} (output + deleted)", flush=True)
+
+_elev_stats(df_land_only, 'LAND')
+_elev_stats(df_lakes_only, 'LAKES')
+_elev_stats(df_ocean_only, 'OCEAN')
 
 # ============================================================================
-# CREATE UNIFIED CLASSIFIED DATASET WITH YEAR COLUMN
+# CREATE UNIFIED CLASSIFIED DATASET
 # ============================================================================
+
 print("\nCreating unified classified dataset...", flush=True)
 
+# Use .assign() to avoid SettingWithCopyWarning
 if total_land > 0:
-    df_land_only['classification'] = 'LAND'
+    df_land_only = df_land_only.assign(classification='LAND')
 if total_lakes > 0:
-    df_lakes_only['classification'] = 'LAKE'
+    df_lakes_only = df_lakes_only.assign(classification='LAKE')
 if total_ocean > 0:
-    df_ocean_only['classification'] = 'OCEAN'
+    df_ocean_only = df_ocean_only.assign(classification='OCEAN')
 
-all_datasets = []
-if total_land > 0:
-    all_datasets.append(df_land_only)
-if total_lakes > 0:
-    all_datasets.append(df_lakes_only)
-if total_ocean > 0:
-    all_datasets.append(df_ocean_only)
+all_datasets = [
+    df for df in [df_land_only, df_lakes_only, df_ocean_only] if len(df) > 0
+]
 
 if all_datasets:
     df_all_classified = pd.concat(all_datasets, ignore_index=True)
 
-    # Extract year from date column
-    date_col = None
-    for possible_col in ['Date', 'date', 'datetime', 'Date/Time', 'acquisition_date']:
-        if possible_col in df_all_classified.columns:
-            date_col = possible_col
-            break
-
-    if date_col:
-        print(f"Extracting year from '{date_col}' column...", flush=True)
-        df_all_classified['year'] = pd.to_datetime(df_all_classified[date_col]).dt.year
+    # Reuse 'year' column from Script 01 if already present and valid
+    if 'year' in df_all_classified.columns and df_all_classified['year'].notna().any():
+        print("  Using existing 'year' column (from Script 01).", flush=True)
     else:
-        print("WARNING: No date column found for year extraction", flush=True)
-        df_all_classified['year'] = None
+        date_col = next(
+            (c for c in ['date', 'Date', 'datetime', 'Date/Time', 'acquisition_date']
+             if c in df_all_classified.columns),
+            None
+        )
+        if date_col:
+            print(f"  Extracting year from '{date_col}' column...", flush=True)
+            df_all_classified['year'] = (
+                pd.to_datetime(df_all_classified[date_col], errors='coerce').dt.year
+            )
+        else:
+            print("  WARNING: No date column found for year extraction.",
+                  flush=True)
+            df_all_classified['year'] = pd.NA
 else:
     df_all_classified = pd.DataFrame()
-    print("No data after filtering!", flush=True)
+    print("WARNING: No data after filtering!", flush=True)
 
 # ============================================================================
-# YEAR-BY-YEAR CLASSIFICATION COUNTS (46-style with percentages)
+# YEAR-BY-YEAR CLASSIFICATION COUNTS
 # ============================================================================
+
 print("\n" + "=" * 80, flush=True)
-print("COMPUTING YEAR-BY-YEAR CLASSIFICATION COUNTS", flush=True)
+print("YEAR-BY-YEAR CLASSIFICATION COUNTS", flush=True)
 print("=" * 80, flush=True)
 
-if len(df_all_classified) > 0 and 'year' in df_all_classified.columns and df_all_classified['year'].notna().any():
-    year_class_counts = df_all_classified.groupby(['year', 'classification']).size().unstack(fill_value=0)
+has_year_data = (
+    len(df_all_classified) > 0
+    and 'year' in df_all_classified.columns
+    and df_all_classified['year'].notna().any()
+)
+
+if has_year_data:
+    year_class_counts = (
+        df_all_classified
+        .groupby(['year', 'classification'], observed=True)
+        .size()
+        .unstack(fill_value=0)
+    )
 
     for col in ['LAND', 'LAKE', 'OCEAN']:
         if col not in year_class_counts.columns:
@@ -496,136 +623,195 @@ if len(df_all_classified) > 0 and 'year' in df_all_classified.columns and df_all
     year_class_counts = year_class_counts[['LAND', 'LAKE', 'OCEAN']]
     year_class_counts['TOTAL'] = year_class_counts.sum(axis=1)
 
-    # Console counts
+    # --- Console: counts ---
     print("\nClassification counts by year:")
-    print("-" * 80)
+    print("-" * 64)
     print(f"{'Year':<8} {'LAND':>12} {'LAKE':>12} {'OCEAN':>12} {'TOTAL':>12}")
-    print("=" * 80)
+    print("=" * 64)
     for year in sorted(year_class_counts.index):
-        land_ct = int(year_class_counts.loc[year, 'LAND'])
-        lake_ct = int(year_class_counts.loc[year, 'LAKE'])
-        ocean_ct = int(year_class_counts.loc[year, 'OCEAN'])
-        total_ct = int(year_class_counts.loc[year, 'TOTAL'])
-        print(f"{int(year):<8} {land_ct:>12,} {lake_ct:>12,} {ocean_ct:>12,} {total_ct:>12,}")
-    print("-" * 80)
-    total_land_counts = int(year_class_counts['LAND'].sum())
-    total_lake_counts = int(year_class_counts['LAKE'].sum())
-    total_ocean_counts = int(year_class_counts['OCEAN'].sum())
-    grand_total_counts = int(year_class_counts['TOTAL'].sum())
-    print(f"{'TOTAL':<8} {total_land_counts:>12,} {total_lake_counts:>12,} {total_ocean_counts:>12,} {grand_total_counts:>12,}")
-    print("=" * 80)
+        r = year_class_counts.loc[year]
+        print(f"{int(year):<8} {int(r.LAND):>12,} {int(r.LAKE):>12,} "
+              f"{int(r.OCEAN):>12,} {int(r.TOTAL):>12,}")
+    print("-" * 64)
+    total_land_ct = int(year_class_counts['LAND'].sum())
+    total_lake_ct = int(year_class_counts['LAKE'].sum())
+    total_ocean_ct = int(year_class_counts['OCEAN'].sum())
+    grand_total_ct = int(year_class_counts['TOTAL'].sum())
+    print(f"{'TOTAL':<8} {total_land_ct:>12,} {total_lake_ct:>12,} "
+          f"{total_ocean_ct:>12,} {grand_total_ct:>12,}")
+    print("=" * 64)
 
-    # Percentages
+    # --- Console: percentages ---
     print("\nClassification percentages by year:")
-    print("-" * 80)
+    print("-" * 52)
     print(f"{'Year':<8} {'LAND %':>12} {'LAKE %':>12} {'OCEAN %':>12}")
-    print("=" * 80)
+    print("=" * 52)
     for year in sorted(year_class_counts.index):
-        total_year = year_class_counts.loc[year, 'TOTAL']
-        if total_year > 0:
-            land_pct = year_class_counts.loc[year, 'LAND'] / total_year * 100
-            lake_pct = year_class_counts.loc[year, 'LAKE'] / total_year * 100
-            ocean_pct = year_class_counts.loc[year, 'OCEAN'] / total_year * 100
-            print(f"{int(year):<8} {land_pct:>11.2f}% {lake_pct:>11.2f}% {ocean_pct:>11.2f}%")
-    print("=" * 80)
+        tot = year_class_counts.loc[year, 'TOTAL']
+        if tot > 0:
+            r = year_class_counts.loc[year]
+            print(f"{int(year):<8} "
+                  f"{r.LAND/tot*100:>11.2f}% "
+                  f"{r.LAKE/tot*100:>11.2f}% "
+                  f"{r.OCEAN/tot*100:>11.2f}%")
+    print("=" * 52)
 
-    # Save to COUNTS_FILE (46-style)
-    print(f"\nSaving year-by-year counts to: {COUNTS_FILE.name}", flush=True)
+    # --- Write COUNTS_FILE ---
     with open(COUNTS_FILE, 'w', encoding='utf-8') as f:
         f.write("=" * 80 + "\n")
         f.write("SCRIPT 02: TERRAIN CLASSIFICATION COUNTS BY YEAR\n")
         f.write("=" * 80 + "\n\n")
         f.write(f"Run ID: {RUN_TIMESTAMP}\n")
+        f.write(f"Product: {PRODUCT}\n")
         f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
 
-        f.write("Classification counts by year:\n")
-        f.write("-" * 80 + "\n")
+        f.write("Counts by year:\n")
+        f.write("-" * 64 + "\n")
         f.write(f"{'Year':<8} {'LAND':>12} {'LAKE':>12} {'OCEAN':>12} {'TOTAL':>12}\n")
-        f.write("=" * 80 + "\n")
+        f.write("=" * 64 + "\n")
         for year in sorted(year_class_counts.index):
-            land_ct = int(year_class_counts.loc[year, 'LAND'])
-            lake_ct = int(year_class_counts.loc[year, 'LAKE'])
-            ocean_ct = int(year_class_counts.loc[year, 'OCEAN'])
-            total_ct = int(year_class_counts.loc[year, 'TOTAL'])
-            f.write(f"{int(year):<8} {land_ct:>12,} {lake_ct:>12,} {ocean_ct:>12,} {total_ct:>12,}\n")
-        f.write("-" * 80 + "\n")
-        f.write(f"{'TOTAL':<8} {total_land_counts:>12,} {total_lake_counts:>12,} {total_ocean_counts:>12,} {grand_total_counts:>12,}\n")
-        f.write("=" * 80 + "\n\n")
+            r = year_class_counts.loc[year]
+            f.write(f"{int(year):<8} {int(r.LAND):>12,} {int(r.LAKE):>12,} "
+                    f"{int(r.OCEAN):>12,} {int(r.TOTAL):>12,}\n")
+        f.write("-" * 64 + "\n")
+        f.write(f"{'TOTAL':<8} {total_land_ct:>12,} {total_lake_ct:>12,} "
+                f"{total_ocean_ct:>12,} {grand_total_ct:>12,}\n")
+        f.write("=" * 64 + "\n\n")
 
-        f.write("Classification percentages by year:\n")
-        f.write("-" * 80 + "\n")
+        f.write("Percentages by year:\n")
+        f.write("-" * 52 + "\n")
         f.write(f"{'Year':<8} {'LAND %':>12} {'LAKE %':>12} {'OCEAN %':>12}\n")
-        f.write("=" * 80 + "\n")
+        f.write("=" * 52 + "\n")
         for year in sorted(year_class_counts.index):
-            total_year = year_class_counts.loc[year, 'TOTAL']
-            if total_year > 0:
-                land_pct = year_class_counts.loc[year, 'LAND'] / total_year * 100
-                lake_pct = year_class_counts.loc[year, 'LAKE'] / total_year * 100
-                ocean_pct = year_class_counts.loc[year, 'OCEAN'] / total_year * 100
-                f.write(f"{int(year):<8} {land_pct:>11.2f}% {lake_pct:>11.2f}% {ocean_pct:>11.2f}%\n")
-        f.write("=" * 80 + "\n")
+            tot = year_class_counts.loc[year, 'TOTAL']
+            if tot > 0:
+                r = year_class_counts.loc[year]
+                f.write(f"{int(year):<8} "
+                        f"{r.LAND/tot*100:>11.2f}% "
+                        f"{r.LAKE/tot*100:>11.2f}% "
+                        f"{r.OCEAN/tot*100:>11.2f}%\n")
+        f.write("=" * 52 + "\n")
 
-    print(f"✓ Year-by-year counts saved to: {COUNTS_FILE.name}", flush=True)
+    print(f"\n✓ Year-by-year counts saved: {COUNTS_FILE.name}", flush=True)
+
 else:
-    print("\nWARNING: Cannot compute year-by-year counts (no date column found or no data)", flush=True)
+    print("\nWARNING: Cannot compute year-by-year counts "
+          "(no valid 'year' data or empty dataset).", flush=True)
 
 # ============================================================================
-# SAVE OUTPUT FILES (46-style, with backup and LAND as default)
+# SAVE OUTPUT FILES
 # ============================================================================
+
 print("\n" + "=" * 80, flush=True)
 print("SAVING OUTPUT FILES", flush=True)
 print("=" * 80 + "\n", flush=True)
 
-# Backup original filtered file
-print(f"1. Backing up original: {BACKUP_FILE.name}")
-if not BACKUP_FILE.exists():
-    INPUT_FILE.rename(BACKUP_FILE)
-else:
-    print(" (already exists, skipping)")
-
-# Save LAND
 if total_land > 0:
     df_land_only.to_csv(LAND_FILE, index=False, encoding='utf-8')
-    size_mb = LAND_FILE.stat().st_size / (1024 ** 2)
-    print(f"2. LAND refined: {LAND_FILE.name} ({size_mb:.1f} MB)")
-# Save LAKES
+    print(f"  LAND:  {LAND_FILE.name} "
+          f"({LAND_FILE.stat().st_size/(1024**2):.1f} MB)", flush=True)
+
 if total_lakes > 0:
     df_lakes_only.to_csv(LAKES_FILE, index=False, encoding='utf-8')
-    size_mb = LAKES_FILE.stat().st_size / (1024 ** 2)
-    print(f"3. LAKES refined: {LAKES_FILE.name} ({size_mb:.1f} MB)")
-# Save OCEAN
+    print(f"  LAKES: {LAKES_FILE.name} "
+          f"({LAKES_FILE.stat().st_size/(1024**2):.1f} MB)", flush=True)
+
 if total_ocean > 0:
     df_ocean_only.to_csv(OCEAN_FILE, index=False, encoding='utf-8')
-    size_mb = OCEAN_FILE.stat().st_size / (1024 ** 2)
-    print(f"4. OCEAN refined: {OCEAN_FILE.name} ({size_mb:.1f} MB)")
+    print(f"  OCEAN: {OCEAN_FILE.name} "
+          f"({OCEAN_FILE.stat().st_size/(1024**2):.1f} MB)", flush=True)
 
-# Save unified classified dataset
 if len(df_all_classified) > 0:
     df_all_classified.to_csv(CLASSIFIED_FILE, index=False, encoding='utf-8')
-    size_mb = CLASSIFIED_FILE.stat().st_size / (1024 ** 2)
-    print(f"5. Unified dataset: {CLASSIFIED_FILE.name} ({size_mb:.1f} MB)")
+    print(f"  UNIFIED: {CLASSIFIED_FILE.name} "
+          f"({CLASSIFIED_FILE.stat().st_size/(1024**2):.1f} MB)", flush=True)
 
-# Set LAND as default input for later scripts
-if total_land > 0:
-    df_land_only.to_csv(OUTPUT_FILE, index=False, encoding='utf-8')
-    print(f"6. Default for pipeline: {OUTPUT_FILE.name}")
+# ============================================================================
+# WRITE FILTERING SUMMARY FILE
+# ============================================================================
+
+with open(FILTERING_FILE, 'w', encoding='utf-8') as f:
+    f.write("=" * 80 + "\n")
+    f.write("SCRIPT 02: ELEVATION FILTERING SUMMARY\n")
+    f.write("=" * 80 + "\n\n")
+    f.write(f"Run ID: {RUN_TIMESTAMP}\n")
+    f.write(f"Product: {PRODUCT}\n")
+    f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+    f.write("ELEVATION THRESHOLDS:\n")
+    f.write(f"  LAND:  >= {LAND_MIN_ELEV} m MSL\n")
+    f.write(f"  LAKES: >= {LAKE_MIN_ELEV} m MSL\n")
+    f.write(f"  OCEAN: <= {OCEAN_MAX_ELEV} m MSL\n\n")
+    f.write(f"Elevation column used: "
+            f"{ELEV_COL or 'NOT FOUND (filtering skipped)'}\n\n")
+    f.write(f"Total photons processed: {total_input:,}\n")
+    f.write(f"Total photons DELETED: {total_deleted:,} ({pct_deleted:.2f}%)\n\n")
+    f.write("Deletions by category:\n")
+    f.write(f"  LAND below {LAND_MIN_ELEV} m: "
+            f"{deleted_photons['LAND_below_threshold']:,}\n")
+    f.write(f"  LAKE below {LAKE_MIN_ELEV} m: "
+            f"{deleted_photons['LAKE_below_threshold']:,}\n")
+    f.write(f"  OCEAN above {OCEAN_MAX_ELEV} m: "
+            f"{deleted_photons['OCEAN_above_threshold']:,}\n\n")
+    f.write("Retained photons:\n")
+    f.write(f"  LAND:  {total_land:,}\n")
+    f.write(f"  LAKES: {total_lakes:,}\n")
+    f.write(f"  OCEAN: {total_ocean:,}\n")
+    f.write(f"  TOTAL: {total_output:,}\n")
+
+print(f"\n✓ Filtering summary: {FILTERING_FILE.name}", flush=True)
+
+# ============================================================================
+# WRITE REFINEMENT SUMMARY FILE
+# ============================================================================
+
+with open(REFINEMENT_FILE, 'w', encoding='utf-8') as f:
+    f.write("=" * 80 + "\n")
+    f.write("SCRIPT 02: TERRAIN CLASSIFICATION & REFINEMENT SUMMARY\n")
+    f.write("=" * 80 + "\n\n")
+    f.write(f"Run ID: {RUN_TIMESTAMP}\n")
+    f.write(f"Product: {PRODUCT}\n")
+    f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+    f.write("GIS LAYERS:\n")
+    f.write(f"  Canada land boundary: {CANADA_LAND_SHAPEFILE}\n")
+    f.write(f"  CanVec waterbodies: "
+            f"{CANVEC_WATERBODY_SHAPEFILE if USE_LAKES else 'NOT USED'}\n")
+    f.write(f"  UTM projection: EPSG:{utm_epsg}\n")
+    f.write(f"  Default CRS fallback: EPSG:{DEFAULT_UTM_EPSG} "
+            f"(NAD83(CSRS) / UTM Zone 9N)\n\n")
+    f.write("CLASSIFICATION RESULTS:\n")
+    f.write(f"  Input photons: {total_input:,}\n")
+    f.write(f"  LAND retained: {total_land:,}\n")
+    f.write(f"  LAKE retained: {total_lakes:,}\n")
+    f.write(f"  OCEAN retained: {total_ocean:,}\n")
+    f.write(f"  DELETED: {total_deleted:,}\n")
+    f.write(f"  OUTPUT TOTAL: {total_output:,}\n\n")
+    f.write("OUTPUT FILES:\n")
+    f.write(f"  {LAND_FILE.name}  <- use this for Scripts 03-07\n")
+    f.write(f"  {LAKES_FILE.name}\n")
+    f.write(f"  {OCEAN_FILE.name}\n")
+    f.write(f"  {CLASSIFIED_FILE.name}\n")
+    f.write(f"  {BACKUP_FILE.name} (original Script 01 backup)\n")
+
+print(f"✓ Refinement summary: {REFINEMENT_FILE.name}", flush=True)
+
+# ============================================================================
+# COMPLETION
+# ============================================================================
 
 print("\n" + "=" * 80, flush=True)
 print("SCRIPT 02 COMPLETE", flush=True)
 print("=" * 80, flush=True)
-
 print("\n✓ Output files created:")
-print(f" • {LAND_FILE.name} (elevation-verified)")
-print(f" • {LAKES_FILE.name} (elevation-verified)")
-print(f" • {OCEAN_FILE.name} (elevation-verified)")
-print(f" • {CLASSIFIED_FILE.name} (unified)")
-print(f" • {COUNTS_FILE.name} (year-by-year)")
-print(f" • {FILTERING_FILE.name} (filtering summary)")
-
+print(f"  • {LAND_FILE.name} (elevation-verified, use for Scripts 03-07)")
+print(f"  • {LAKES_FILE.name} (elevation-verified)")
+print(f"  • {OCEAN_FILE.name} (elevation-verified)")
+print(f"  • {CLASSIFIED_FILE.name} (unified)")
+print(f"  • {BACKUP_FILE.name} (original backup)")
+print(f"  • {COUNTS_FILE.name}")
+print(f"  • {FILTERING_FILE.name}")
+print(f"  • {REFINEMENT_FILE.name}")
 print("\nNext steps:")
-print(" • Scripts 03-07 will process LAND data automatically")
-print(" • Review 02_filtering_summary.txt for elevation filtering details")
-print(" • Use 02_photon_counts_by_year_class.txt for temporal analysis")
-print(" • Use icesat2_terrain_classified.csv for downstream analysis")
-
+print("  • Scripts 03-07 read from: icesat2_filtered_ground_photons_LAND.csv")
+print("  • Review 02_filtering_summary.txt for elevation filtering details")
+print("  • Review 02_refinement_summary.txt for full classification summary")
 print("\n" + "=" * 80, flush=True)

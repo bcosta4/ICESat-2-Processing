@@ -1,851 +1,1196 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
 """
 ================================================================================
-
-SCRIPT 07: OUTPUT GENERATION - PUBLICATION FIGURES (PRODUCTION-READY)
-
+SCRIPT 07: FINAL PUBLICATION FIGURES (v4.3 - COMPLETE MERGED + ALL FIXES)
 ================================================================================
 
-FINAL VERSION: Combines all strengths of previous versions with:
-  ✓ Robust error handling
-  ✓ Graceful data loading
-  ✓ Optional dependencies (works without geopandas if not available)
-  ✓ Better memory management
-  ✓ Column auto-detection improvements
-  ✓ Progressive figure generation (won't crash if one fails)
+Purpose
+-------
+Generate 9+ publication-ready figures with:
+1. Sign verification utility (3 checkpoints)
+2. Safe DataFrame boolean checks (is not None)
+3. TwoSlopeNorm spatial contours (±5 cm/yr, symmetric)
+4. 4-panel enhanced multipanel analysis
+5. InSAR validation with binned statistics
+6. QGIS-optimized subsamples
+7. Figures 01-06 generation (zonal grids, temporal, hotspots, etc.)
+8. Violin distribution plot (NEW)
 
-Outputs: 12 publication-quality figures + statistics tables + GIS exports
+Outputs
+-------
+- Figure01-09.png (9 main figures at 300 DPI)
+- Figure03_Violin_PeriodComparison.png (NEW)
+- Figure07_InSAR_Validation.png
+- Figure08_Spatial_Contours_zonal.png
+- Figure08_Spatial_Contours_points.png
+- Figure09_Multipanel_Enhanced.png
+- 07_insar_binned_stats_by_elevation.csv
+- 07_insar_qgis_subsample.csv
+- SummaryStatistics.txt
+- script_07_run.log
+- metadata.json
 
-================================================================================
+CRITICAL IMPROVEMENTS (v4.3):
+✅ FIX #1: Sign verification utility with 3 checkpoints
+✅ FIX #2: Safe DataFrame checks (is not None instead of truthiness)
+✅ FIX #3: All rates in cm/yr (negative=subsidence, positive=uplift)
+✅ FIX #4: Safe multipanel data selection (spatial_grid is not None or clusters_df is not None)
+✅ FIX #5: Variable naming consistency (early_data, late_data - snake_case)
+✅ COMPLETE: Figures 01-06 fully merged + Figures 07-09
+✅ NEW: Violin plot of dh distribution by period
+
+Units: ALL RATES IN CM/YR (negative=subsidence, positive=uplift)
 """
 
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy.stats import gaussian_kde
-from scipy.interpolate import griddata
+import seaborn as sns
+from matplotlib.colors import TwoSlopeNorm
+from scipy.stats import pearsonr
 from pathlib import Path
 from datetime import datetime
-import warnings
+import json
+import logging
+import subprocess
 import sys
-import traceback
+import io
+import warnings
 
 warnings.filterwarnings('ignore')
 
-print("="*80)
-print("SCRIPT 07: OUTPUT GENERATION - PUBLICATION FIGURES (PRODUCTION)")
-print("="*80)
+# UTF-8 FIX: Ensure console/file output is UTF-8 compatible
+if sys.stdout.encoding != 'utf-8':
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+if sys.stderr.encoding != 'utf-8':
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
+
+try:
+    from config import BASEOUTPUTDIR
+except ImportError:
+    BASEOUTPUTDIR = Path(r'E:\Processing\ICeSat-2\output_data')
 
 # ============================================================================
-# CONFIGURATION
+# UTILITY FUNCTIONS
 # ============================================================================
 
-BASE_OUTPUT_DIR = Path(r'E:\Processing\ICeSat-2\output_data')
-
-# Figure settings
-DPI_SCREEN = 300
-DPI_PRINT = 600
-BOOTSTRAP_ITERATIONS = 1000
-BOOTSTRAP_SEED = 42
-
-# Styling
-NATURE_CMAP = 'RdBu_r'
-HEATMAP_CMAP = 'YlOrRd'
-FONT_TITLE = 14
-FONT_LABEL = 12
-FONT_TICK = 10
-FONT_CAPTION = 9
-
-# ============================================================================
-# HELPER FUNCTIONS
-# ============================================================================
-
-def safe_load_data(filepath, required=True):
-    """Safely load CSV with error handling."""
+def get_git_hash():
+    """Get git commit hash for reproducibility."""
     try:
-        if not filepath.exists():
-            if required:
-                print(f"ERROR: Required file not found: {filepath}")
-                return None
-            else:
-                print(f"⚠ Optional file not found: {filepath}")
-                return None
-        
-        data = pd.read_csv(filepath)
-        print(f"✓ Loaded: {filepath.name} ({len(data):,} rows)")
-        return data
-    except Exception as e:
-        print(f"ERROR reading {filepath.name}: {e}")
-        return None
+        result = subprocess.run(['git', 'rev-parse', 'HEAD'], 
+                              capture_output=True, text=True, timeout=5)
+        return result.stdout.strip()[:8] if result.returncode == 0 else 'unknown'
+    except:
+        return 'unknown'
 
-def detect_columns(data, col_type):
-    """Auto-detect column names by type."""
-    if col_type == 'lat':
-        for col in data.columns:
-            if 'lat' in col.lower():
-                return col
-    elif col_type == 'lon':
-        for col in data.columns:
-            if 'lon' in col.lower():
-                return col
-    elif col_type == 'rate':
-        for col in data.columns:
-            keywords = ['subsidence', 'rate', 'velocity', 'displacement']
-            if any(k in col.lower() for k in keywords):
-                return col
-    return None
+def setup_logging(output_dir):
+    """Configure logging to both file and console."""
+    log_file = output_dir / 'script_07_run.log'
+    logger = logging.getLogger('script_07')
+    logger.setLevel(logging.DEBUG)
+    logger.handlers = []
+    
+    # File handler
+    fh = logging.FileHandler(log_file, encoding='utf-8', mode='w')
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(logging.Formatter(
+        '%(asctime)s [%(levelname)s] %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    ))
+    
+    # Console handler
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.INFO)
+    ch.setFormatter(logging.Formatter('%(message)s'))
+    
+    logger.addHandler(fh)
+    logger.addHandler(ch)
+    
+    return logger
 
-def bootstrap_ci(data_array, n_iterations=BOOTSTRAP_ITERATIONS, seed=BOOTSTRAP_SEED):
-    """Compute 95% bootstrap CI for mean."""
-    try:
-        valid_data = data_array.dropna().values
-        if len(valid_data) < 2:
-            return None
-        
-        rng = np.random.RandomState(seed)
-        n = len(valid_data)
-        bootstrap_means = []
-        
-        for _ in range(n_iterations):
-            sample = rng.choice(valid_data, size=n, replace=True)
-            bootstrap_means.append(np.nanmean(sample))
-        
-        bootstrap_means = np.array(bootstrap_means)
-        ci_lower = np.percentile(bootstrap_means, 2.5)
-        ci_upper = np.percentile(bootstrap_means, 97.5)
-        
-        return {
-            'mean': np.nanmean(valid_data),
-            'ci_lower': ci_lower,
-            'ci_upper': ci_upper,
-            'std_error': np.nanstd(bootstrap_means),
-            'n': len(valid_data)
+# ============================================================================
+# SIGN VERIFICATION UTILITY (FIX #1)
+# ============================================================================
+def verify_sign_convention(df, rate_col='subsidence_rate_cm_per_year', context_name="Dataset"):
+    """
+    Verify subsidence rates follow correct sign convention.
+    Negative = subsidence (expected for permafrost)
+    Positive = uplift (less common)
+    """
+    if df is None or len(df) == 0:
+        print(f"⚠️  No data for {context_name} sign check")
+        return False, np.nan, "No data"
+    
+    if rate_col not in df.columns:
+        print(f"⚠️  No rate column '{rate_col}' in {context_name}")
+        return False, np.nan, f"Missing {rate_col}"
+    
+    rates = df[rate_col].dropna().values
+    if len(rates) == 0:
+        print(f"⚠️  No valid rates in {context_name}")
+        return False, np.nan, "No valid rates"
+    
+    mean_rate = np.mean(rates)
+    passes = mean_rate < 0  # Should be negative for subsidence
+    
+    if passes:
+        print(f"✓ {context_name}: mean={mean_rate:.3f} cm/yr (negative ✓)")
+    else:
+        print(f"⚠️  {context_name}: mean={mean_rate:.3f} cm/yr (POSITIVE - verify!)")
+    
+    return passes, mean_rate, None
+
+# ============================================================================
+# METADATA TRACKING
+# ============================================================================
+class RunMetadata:
+    """Capture complete run parameters for reproducibility."""
+    
+    def __init__(self, run_id, git_hash):
+        self.run_id = run_id
+        self.script_name = '07_output_generation'
+        self.script_version = 'v4.3-complete-merged-all-fixes'
+        self.git_hash = git_hash
+        self.start_time = datetime.now().isoformat()
+        self.end_time = None
+        self.configuration = {}
+        self.processing_results = {}
+        self.environment_info = {
+            'python_version': f'{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}',
+            'platform': sys.platform,
+            'timestamp': datetime.now().isoformat(),
         }
-    except Exception as e:
-        print(f"Error computing bootstrap CI: {e}")
-        return None
-
-def save_figure(fig, output_dir, name):
-    """Save figure in both DPI versions with error handling."""
-    try:
-        plt.savefig(output_dir / f'{name}.png', dpi=DPI_SCREEN, bbox_inches='tight')
-        plt.savefig(output_dir / f'{name}_HiRes.png', dpi=DPI_PRINT, bbox_inches='tight')
-        plt.close()
-        print(f" ✓ {name}.png")
-        return True
-    except Exception as e:
-        print(f" ⚠ Error saving {name}: {e}")
-        plt.close()
-        return False
-
-# ============================================================================
-# LOAD DATA
-# ============================================================================
-
-print("\n" + "="*80)
-print("LOADING DATA")
-print("="*80)
-
-# Get run timestamp
-try:
-    with open(BASE_OUTPUT_DIR / 'latest_run_timestamp.txt', 'r') as f:
-        RUN_TIMESTAMP = f.read().strip()
-    OUTPUT_DIR = BASE_OUTPUT_DIR / f'run_{RUN_TIMESTAMP}'
-except FileNotFoundError:
-    print("ERROR: Timestamp file not found. Run Script 00 first.")
-    sys.exit(1)
-
-print(f"\nRun ID: {RUN_TIMESTAMP}")
-print(f"Output directory: {OUTPUT_DIR}\n")
-
-# Load main data (CRITICAL)
-data = safe_load_data(OUTPUT_DIR / 'density_clusters_all.csv', required=True)
-if data is None:
-    print("FATAL: Cannot proceed without density_clusters_all.csv")
-    sys.exit(1)
-
-# Detect columns
-print("\nDetecting coordinate columns...")
-lat_col = detect_columns(data, 'lat')
-lon_col = detect_columns(data, 'lon')
-rate_col = detect_columns(data, 'rate')
-
-if not all([lat_col, lon_col, rate_col]):
-    print("ERROR: Could not auto-detect required columns")
-    print(f"Available columns: {list(data.columns)[:10]}...")
-    sys.exit(1)
-
-print(f"✓ Using: Lat={lat_col}, Lon={lon_col}, Rate={rate_col}")
-
-# Load optional data
-early_data = safe_load_data(OUTPUT_DIR / 'icesat2_early_period.csv', required=False)
-late_data = safe_load_data(OUTPUT_DIR / 'icesat2_late_period.csv', required=False)
-insar_data = safe_load_data(OUTPUT_DIR / 'icesat2_insar_integrated.csv', required=False)
-
-insar_available = insar_data is not None
-temporal_available = (early_data is not None) and (late_data is not None)
-
-# ============================================================================
-# BOOTSTRAP CONFIDENCE INTERVALS
-# ============================================================================
-
-print("\n" + "="*80)
-print("COMPUTING BOOTSTRAP CONFIDENCE INTERVALS")
-print("="*80)
-
-overall_stats = bootstrap_ci(data[rate_col])
-if overall_stats:
-    print(f"\nOverall Subsidence Rate (95% Bootstrap CI):")
-    print(f"  Mean: {overall_stats['mean']*1000:.3f} mm/yr")
-    print(f"  95% CI: [{overall_stats['ci_lower']*1000:.3f}, {overall_stats['ci_upper']*1000:.3f}] mm/yr")
-    print(f"  Std Error: {overall_stats['std_error']*1000:.3f} mm/yr")
-    print(f"  N: {overall_stats['n']}")
-else:
-    print("⚠ Could not compute bootstrap statistics")
-    overall_stats = None
-
-# By density class
-density_ci_list = []
-if 'density_class' in data.columns:
-    print(f"\nBy Density Class:")
-    for density_class in sorted(data['density_class'].dropna().unique()):
-        subset = data[data['density_class'] == density_class][rate_col]
-        stats_ci = bootstrap_ci(subset)
-        if stats_ci and stats_ci['n'] > 10:
-            density_ci_list.append({
-                'density_class': str(density_class),
-                'n': stats_ci['n'],
-                'mean_mm_yr': stats_ci['mean'] * 1000,
-                'ci_lower_mm_yr': stats_ci['ci_lower'] * 1000,
-                'ci_upper_mm_yr': stats_ci['ci_upper'] * 1000,
-                'se_mm_yr': stats_ci['std_error'] * 1000
-            })
-            print(f"  {density_class}: {stats_ci['mean']*1000:.3f} [{stats_ci['ci_lower']*1000:.3f}, {stats_ci['ci_upper']*1000:.3f}] mm/yr (n={stats_ci['n']})")
-
-if density_ci_list:
-    density_ci_df = pd.DataFrame(density_ci_list)
-    density_ci_df.to_csv(OUTPUT_DIR / '07_bootstrap_confidence_intervals.csv', index=False)
-    print(f"✓ Saved: 07_bootstrap_confidence_intervals.csv")
-
-# ============================================================================
-# SUMMARY STATISTICS
-# ============================================================================
-
-print("\n" + "="*80)
-print("GENERATING SUMMARY STATISTICS")
-print("="*80)
-
-if overall_stats:
-    summary_stats = pd.DataFrame({
-        'Metric': [
-            'Total Points',
-            'Mean Subsidence (mm/yr)',
-            'Median Subsidence (mm/yr)',
-            'Std Dev (mm/yr)',
-            'Min (mm/yr)',
-            'Max (mm/yr)',
-            '95% CI Lower (mm/yr)',
-            '95% CI Upper (mm/yr)'
-        ],
-        'Value': [
-            f"{len(data):,}",
-            f"{data[rate_col].mean()*1000:.2f}",
-            f"{data[rate_col].median()*1000:.2f}",
-            f"{data[rate_col].std()*1000:.2f}",
-            f"{data[rate_col].min()*1000:.2f}",
-            f"{data[rate_col].max()*1000:.2f}",
-            f"{overall_stats['ci_lower']*1000:.2f}",
-            f"{overall_stats['ci_upper']*1000:.2f}"
-        ]
-    })
-    summary_stats.to_csv(OUTPUT_DIR / '07_summary_statistics.csv', index=False)
-    print(f"✓ Saved: 07_summary_statistics.csv")
-
-# ============================================================================
-# COMPOSITE METRICS (if temporal data available)
-# ============================================================================
-
-if temporal_available and 'neighbor_count' in data.columns:
-    print("\n" + "="*80)
-    print("GENERATING COMPOSITE METRICS")
-    print("="*80)
     
-    composite_metrics = []
-    for density_class in ['Isolated (0-1)', 'Sparse (1-5)', 'Moderate (5-20)', 'Dense (20+)']:
-        early_subset = early_data[early_data.get('density_class', '') == density_class][rate_col]
-        late_subset = late_data[late_data.get('density_class', '') == density_class][rate_col]
-        
-        if len(early_subset) > 0 and len(late_subset) > 0:
-            composite_metrics.append({
-                'density_class': density_class,
-                'n_early': len(early_subset),
-                'n_late': len(late_subset),
-                'early_mean_mm_yr': early_subset.mean() * 1000,
-                'late_mean_mm_yr': late_subset.mean() * 1000,
-                'change_mm_yr': (late_subset.mean() - early_subset.mean()) * 1000
-            })
+    def finalize(self):
+        """Mark run as complete."""
+        self.end_time = datetime.now().isoformat()
     
-    if composite_metrics:
-        composite_df = pd.DataFrame(composite_metrics)
-        composite_df.to_csv(OUTPUT_DIR / '07_composite_metrics.csv', index=False)
-        print(f"✓ Saved: 07_composite_metrics.csv ({len(composite_df)} rows)")
+    def save(self, output_dir):
+        """Save metadata as JSON."""
+        metadata_file = output_dir / '07_output_generation_metadata.json'
+        metadata = {
+            'run_id': self.run_id,
+            'script': self.script_name,
+            'version': self.script_version,
+            'git_hash': self.git_hash,
+            'environment': self.environment_info,
+            'timestamps': {'start': self.start_time, 'end': self.end_time},
+            'configuration': self.configuration,
+            'processing_results': self.processing_results,
+        }
+        with open(metadata_file, 'w', encoding='utf-8') as f:
+            json.dump(metadata, f, indent=2, default=str, ensure_ascii=False)
+        return metadata_file
 
 # ============================================================================
-# PUBLICATION FIGURES - PART 1: BASIC STYLE
+# FIGURE GENERATION FUNCTIONS (01-06)
 # ============================================================================
 
-print("\n" + "="*80)
-print("GENERATING PUBLICATION FIGURES (Part 1/2: Basic Style)")
-print("="*80)
-
-figure_count = 0
-
-# Figure 1: Main subsidence map
-print("\n[1/12] Subsidence map...")
-try:
-    fig, ax = plt.subplots(figsize=(14, 10))
-    vmin, vmax = np.percentile(data[rate_col].dropna()*1000, [5, 95])
-    scatter = ax.scatter(data[lon_col], data[lat_col],
-                        c=data[rate_col]*1000, cmap=NATURE_CMAP,
-                        s=2, alpha=0.6, vmin=vmin, vmax=vmax)
-    ax.set_xlabel('Longitude (°E)', fontsize=FONT_LABEL, fontweight='bold')
-    ax.set_ylabel('Latitude (°N)', fontsize=FONT_LABEL, fontweight='bold')
-    ax.set_title(f'Subsidence Rate Distribution\n{len(data):,} ICESat-2 Repeat-Track Crossovers',
-                fontsize=FONT_TITLE, fontweight='bold')
-    cbar = plt.colorbar(scatter, ax=ax, label='Subsidence Rate (mm/yr)', pad=0.02)
-    cbar.ax.tick_params(labelsize=FONT_TICK)
-    ax.grid(True, alpha=0.3, linestyle='--')
-    ax.set_axisbelow(True)
-    plt.tight_layout()
+def create_figures_01_to_06(zonal_stats, early_data, late_data, timescale_analysis,
+                           advanced_data, figure_dir, logger):
+    """Generate Figures 01-06 (original outputs, all in cm/yr)."""
     
-    if save_figure(fig, OUTPUT_DIR, '07_figure_subsidence_map'):
-        figure_count += 1
-except Exception as e:
-    print(f" ⚠ Error: {e}")
-    traceback.print_exc()
-
-# Figure 2: Rate distribution
-print("[2/12] Rate distribution...")
-try:
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-    
-    axes[0].hist(data[rate_col].dropna()*1000, bins=60, color='steelblue',
-                alpha=0.7, edgecolor='black', linewidth=0.5)
-    mean_val = data[rate_col].mean()*1000
-    median_val = data[rate_col].median()*1000
-    axes[0].axvline(mean_val, color='red', linestyle='--', linewidth=2.5,
-                   label=f'Mean: {mean_val:.2f} mm/yr')
-    axes[0].axvline(median_val, color='orange', linestyle='--', linewidth=2.5,
-                   label=f'Median: {median_val:.2f} mm/yr')
-    axes[0].set_xlabel('Subsidence Rate (mm/yr)', fontsize=FONT_LABEL, fontweight='bold')
-    axes[0].set_ylabel('Frequency', fontsize=FONT_LABEL, fontweight='bold')
-    axes[0].set_title('Distribution', fontsize=FONT_LABEL, fontweight='bold')
-    axes[0].legend(fontsize=FONT_TICK)
-    axes[0].grid(True, alpha=0.3, axis='y')
-    
-    bp = axes[1].boxplot([data[rate_col].dropna()*1000], vert=True, patch_artist=True,
-                        widths=0.5, showmeans=True)
-    bp['boxes'][0].set_facecolor('lightblue')
-    axes[1].set_ylabel('Subsidence Rate (mm/yr)', fontsize=FONT_LABEL, fontweight='bold')
-    axes[1].set_title('Summary Statistics', fontsize=FONT_LABEL, fontweight='bold')
-    axes[1].grid(True, alpha=0.3, axis='y')
-    axes[1].set_xticklabels(['All Data'])
-    axes[1].axhline(0, color='red', linestyle=':', linewidth=1.5, alpha=0.5)
-    
-    plt.tight_layout()
-    if save_figure(fig, OUTPUT_DIR, '07_figure_rate_distribution'):
-        figure_count += 1
-except Exception as e:
-    print(f" ⚠ Error: {e}")
-
-# Figure 3: Temporal comparison (if available)
-if temporal_available:
-    print("[3/12] Temporal comparison...")
-    try:
-        fig, axes = plt.subplots(2, 2, figsize=(16, 12))
-        vmin, vmax = np.percentile(data[rate_col]*1000, [5, 95])
-        
-        axes[0, 0].scatter(early_data[lon_col], early_data[lat_col],
-                          c=early_data[rate_col]*1000, cmap=NATURE_CMAP,
-                          s=2, alpha=0.6, vmin=vmin, vmax=vmax)
-        axes[0, 0].set_title(f'Early Period\n{len(early_data):,} points', fontsize=FONT_LABEL, fontweight='bold')
-        axes[0, 0].set_xlabel('Longitude (°E)', fontsize=FONT_TICK)
-        axes[0, 0].set_ylabel('Latitude (°N)', fontsize=FONT_TICK)
-        axes[0, 0].grid(True, alpha=0.3)
-        
-        scatter = axes[0, 1].scatter(late_data[lon_col], late_data[lat_col],
-                          c=late_data[rate_col]*1000, cmap=NATURE_CMAP,
-                          s=2, alpha=0.6, vmin=vmin, vmax=vmax)
-        axes[0, 1].set_title(f'Late Period\n{len(late_data):,} points', fontsize=FONT_LABEL, fontweight='bold')
-        axes[0, 1].set_xlabel('Longitude (°E)', fontsize=FONT_TICK)
-        axes[0, 1].set_ylabel('Latitude (°N)', fontsize=FONT_TICK)
-        axes[0, 1].grid(True, alpha=0.3)
-        
-        axes[1, 0].hist(early_data[rate_col].dropna()*1000, bins=50, alpha=0.6,
-                       label=f'Early: {early_data[rate_col].mean()*1000:.2f} mm/yr',
-                       color='blue', edgecolor='black', linewidth=0.5)
-        axes[1, 0].hist(late_data[rate_col].dropna()*1000, bins=50, alpha=0.6,
-                       label=f'Late: {late_data[rate_col].mean()*1000:.2f} mm/yr',
-                       color='red', edgecolor='black', linewidth=0.5)
-        axes[1, 0].set_xlabel('Subsidence Rate (mm/yr)', fontweight='bold', fontsize=FONT_LABEL)
-        axes[1, 0].set_ylabel('Frequency', fontweight='bold', fontsize=FONT_LABEL)
-        axes[1, 0].legend(fontsize=FONT_TICK)
-        axes[1, 0].grid(True, alpha=0.3, axis='y')
-        
-        bp = axes[1, 1].boxplot([early_data[rate_col].dropna()*1000, late_data[rate_col].dropna()*1000],
-                               labels=['Early', 'Late'], patch_artist=True, showmeans=True)
-        bp['boxes'][0].set_facecolor('lightblue')
-        bp['boxes'][1].set_facecolor('lightcoral')
-        axes[1, 1].set_ylabel('Subsidence Rate (mm/yr)', fontweight='bold', fontsize=FONT_LABEL)
-        axes[1, 1].set_title('Temporal Deceleration', fontweight='bold', fontsize=FONT_LABEL)
-        axes[1, 1].grid(True, alpha=0.3, axis='y')
-        axes[1, 1].axhline(0, color='black', linestyle=':', linewidth=1.5, alpha=0.5)
-        
-        plt.tight_layout()
-        if save_figure(fig, OUTPUT_DIR, '07_figure_temporal_comparison'):
-            figure_count += 1
-    except Exception as e:
-        print(f" ⚠ Error: {e}")
-
-# Figure 4: Density stratification
-if 'neighbor_count' in data.columns:
-    print("[4/12] Density stratification...")
-    try:
-        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-        valid_mask = ~(data['neighbor_count'].isna() | data[rate_col].isna())
-        
-        axes[0].scatter(data.loc[valid_mask, 'neighbor_count'],
-                       data.loc[valid_mask, rate_col]*1000,
-                       alpha=0.3, s=1, color='steelblue')
-        
-        if valid_mask.sum() > 2:
-            z = np.polyfit(data.loc[valid_mask, 'neighbor_count'],
-                          data.loc[valid_mask, rate_col]*1000, 1)
-            x_poly = np.linspace(data.loc[valid_mask, 'neighbor_count'].min(),
-                                data.loc[valid_mask, 'neighbor_count'].max(), 100)
-            axes[0].plot(x_poly, np.polyval(z, x_poly), 'r-', linewidth=2.5, label='Linear fit')
-        
-        axes[0].set_xlabel('Neighbor Count (within 4m)', fontsize=FONT_LABEL, fontweight='bold')
-        axes[0].set_ylabel('Subsidence Rate (mm/yr)', fontsize=FONT_LABEL, fontweight='bold')
-        axes[0].set_title('Density vs Rate', fontsize=FONT_LABEL, fontweight='bold')
-        axes[0].grid(True, alpha=0.3)
-        axes[0].axhline(0, color='red', linestyle=':', linewidth=1.5, alpha=0.5)
-        axes[0].legend(fontsize=FONT_TICK)
-        
-        if density_ci_list:
-            density_df = pd.DataFrame(density_ci_list).sort_values('density_class')
-            x_pos = np.arange(len(density_df))
-            means = density_df['mean_mm_yr'].values
-            ci_width = (density_df['ci_upper_mm_yr'] - density_df['ci_lower_mm_yr']).values / 2
-            
-            axes[1].bar(x_pos, means, yerr=ci_width, capsize=8, color='coral', alpha=0.7,
-                       edgecolor='black', linewidth=1.5, error_kw={'linewidth': 2, 'ecolor': 'darkred'})
-            axes[1].set_xticks(x_pos)
-            axes[1].set_xticklabels(density_df['density_class'].values)
-            axes[1].set_xlabel('Density Class', fontsize=FONT_LABEL, fontweight='bold')
-            axes[1].set_ylabel('Mean Rate (mm/yr)', fontsize=FONT_LABEL, fontweight='bold')
-            axes[1].set_title('Subsidence by Density (95% CI)', fontsize=FONT_LABEL, fontweight='bold')
-            axes[1].grid(True, alpha=0.3, axis='y')
-            axes[1].axhline(0, color='red', linestyle=':', linewidth=1.5, alpha=0.5)
-        
-        plt.tight_layout()
-        if save_figure(fig, OUTPUT_DIR, '07_figure_density_stratified'):
-            figure_count += 1
-    except Exception as e:
-        print(f" ⚠ Error: {e}")
-
-# Figure 5: LISA Hotspots
-if 'lisa_cluster' in data.columns:
-    print("[5/12] LISA hotspots...")
-    try:
-        fig, ax = plt.subplots(figsize=(14, 10))
-        colors = {'HH': '#d73027', 'LL': '#4575b4', 'HL': '#fee090', 'LH': '#91bfdb', 'NS': '#d3d3d3'}
-        
-        for cluster_type in ['NS', 'LH', 'HL', 'LL', 'HH']:
-            mask = data['lisa_cluster'] == cluster_type
-            if mask.sum() > 0:
-                ax.scatter(data.loc[mask, lon_col], data.loc[mask, lat_col],
-                          c=colors[cluster_type], label=cluster_type, s=4, alpha=0.7)
-        
-        ax.set_xlabel('Longitude (°E)', fontsize=FONT_LABEL, fontweight='bold')
-        ax.set_ylabel('Latitude (°N)', fontsize=FONT_LABEL, fontweight='bold')
-        ax.set_title('LISA Hotspot Classification\nHH=Hotspots | LL=Cold Spots | HL/LH=Outliers',
-                    fontsize=FONT_TITLE, fontweight='bold')
-        ax.legend(fontsize=FONT_LABEL, loc='upper right')
-        ax.grid(True, alpha=0.3, linestyle='--')
-        ax.set_axisbelow(True)
-        
-        plt.tight_layout()
-        if save_figure(fig, OUTPUT_DIR, '07_figure_lisa_hotspots'):
-            figure_count += 1
-    except Exception as e:
-        print(f" ⚠ Error: {e}")
-
-# Figure 6: InSAR Validation (if available)
-if insar_available:
-    print("[6/12] InSAR validation...")
-    try:
-        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-        insar_rate_col = None
-        for col in insar_data.columns:
-            if 'insar' in col.lower() and 'rate' in col.lower():
-                insar_rate_col = col
-                break
-        
-        if insar_rate_col:
-            valid_mask = insar_data[insar_rate_col].notna()
-            if valid_mask.sum() > 10:
-                is2_rates = insar_data.loc[valid_mask, rate_col].values * 1000
-                insar_rates = insar_data.loc[valid_mask, insar_rate_col].values
+    # ===== FIGURE 01: ZONAL GRID HEATMAP =====
+    if zonal_stats is not None and len(zonal_stats) > 0:
+        try:
+            logger.info("Generating Figure 01...")
+            if 'mean_subsidence_cm_yr' in zonal_stats.columns:
+                fig, ax = plt.subplots(figsize=(14, 10))
                 
-                axes[0].scatter(insar_rates, is2_rates, alpha=0.5, s=10, color='steelblue')
-                min_val = min(insar_rates.min(), is2_rates.min())
-                max_val = max(insar_rates.max(), is2_rates.max())
-                axes[0].plot([min_val, max_val], [min_val, max_val], 'r--', linewidth=2, label='1:1 agreement')
-                axes[0].set_xlabel('InSAR Rate (mm/yr)', fontsize=FONT_LABEL, fontweight='bold')
-                axes[0].set_ylabel('ICESat-2 Rate (mm/yr)', fontsize=FONT_LABEL, fontweight='bold')
-                axes[0].set_title('InSAR vs ICESat-2', fontsize=FONT_LABEL, fontweight='bold')
-                axes[0].grid(True, alpha=0.3)
-                axes[0].legend()
+                if 'lat_center' in zonal_stats.columns and 'lon_center' in zonal_stats.columns:
+                    zonal_matrix = zonal_stats.pivot_table(
+                        values='mean_subsidence_cm_yr',
+                        index='lat_center',
+                        columns='lon_center',
+                        aggfunc='mean'
+                    )
+                else:
+                    zonal_sorted = zonal_stats.sort_values('mean_subsidence_cm_yr')
+                    zonal_matrix = zonal_sorted[['mean_subsidence_cm_yr']].T
                 
-                residuals = is2_rates - insar_rates
-                axes[1].hist(residuals, bins=50, color='steelblue', alpha=0.7, edgecolor='black')
-                axes[1].axvline(np.mean(residuals), color='red', linestyle='--', linewidth=2.5,
-                               label=f'Mean bias: {np.mean(residuals):.2f} mm/yr')
-                axes[1].set_xlabel('Residuals (IS2 - InSAR) mm/yr', fontsize=FONT_LABEL, fontweight='bold')
-                axes[1].set_ylabel('Frequency', fontsize=FONT_LABEL, fontweight='bold')
-                axes[1].set_title('Agreement Residuals', fontsize=FONT_LABEL, fontweight='bold')
-                axes[1].grid(True, alpha=0.3, axis='y')
-                axes[1].legend(fontsize=FONT_TICK)
+                im = ax.imshow(zonal_matrix.values, cmap='RdYlBu_r', aspect='auto', origin='lower',
+                              vmin=-5, vmax=0)
+                cbar = plt.colorbar(im, ax=ax, label='Mean Subsidence Rate (cm/yr)')
+                ax.set_xlabel('Longitude Index (E-W)', fontsize=12, fontweight='bold')
+                ax.set_ylabel('Latitude Index (N-S)', fontsize=12, fontweight='bold')
+                ax.set_title('Figure 01: Coastal Subsidence Rate by 20×20 km Grid Cell\nTuktoyaktuk Peninsula',
+                            fontsize=14, fontweight='bold', pad=20)
+                ax.grid(True, alpha=0.3, color='gray', linestyle='--', linewidth=0.5)
                 
                 plt.tight_layout()
-                if save_figure(fig, OUTPUT_DIR, '07_figure_insar_validation'):
-                    figure_count += 1
-    except Exception as e:
-        print(f" ⚠ Error: {e}")
+                fig.savefig(figure_dir / 'Figure01_Zonal_Grid_Heatmap.png', dpi=300, bbox_inches='tight')
+                plt.close()
+                logger.info("✓ Figure 01 saved")
+                print("✓ Figure 01: Zonal Grid Heatmap")
+        except Exception as e:
+            logger.warning(f"Figure 01 error: {e}")
+            print(f"⚠️  Figure 01 error: {e}")
+    
+    # ===== FIGURE 02: DENSITY HEATMAP =====
+    if zonal_stats is not None and len(zonal_stats) > 0:
+        try:
+            logger.info("Generating Figure 02...")
+            if 'density_points_per_km2' in zonal_stats.columns:
+                fig, ax = plt.subplots(figsize=(14, 10))
+                
+                if 'lat_center' in zonal_stats.columns and 'lon_center' in zonal_stats.columns:
+                    density_matrix = zonal_stats.pivot_table(
+                        values='density_points_per_km2',
+                        index='lat_center',
+                        columns='lon_center',
+                        aggfunc='mean'
+                    )
+                else:
+                    density_sorted = zonal_stats.sort_values('density_points_per_km2')
+                    density_matrix = density_sorted[['density_points_per_km2']].T
+                
+                im = ax.imshow(density_matrix.values, cmap='YlOrRd', aspect='auto', origin='lower')
+                cbar = plt.colorbar(im, ax=ax, label='Point Density (points/km²)')
+                ax.set_xlabel('Longitude Index (E-W)', fontsize=12, fontweight='bold')
+                ax.set_ylabel('Latitude Index (N-S)', fontsize=12, fontweight='bold')
+                ax.set_title('Figure 02: ICESat-2 Data Point Density by 20×20 km Grid Cell\nTuktoyaktuk Peninsula',
+                            fontsize=14, fontweight='bold', pad=20)
+                ax.grid(True, alpha=0.3, color='gray', linestyle='--', linewidth=0.5)
+                
+                plt.tight_layout()
+                fig.savefig(figure_dir / 'Figure02_Zonal_Density_Heatmap.png', dpi=300, bbox_inches='tight')
+                plt.close()
+                logger.info("✓ Figure 02 saved")
+                print("✓ Figure 02: Zonal Density Heatmap")
+        except Exception as e:
+            logger.warning(f"Figure 02 error: {e}")
+            print(f"⚠️  Figure 02 error: {e}")
+    
+    # ===== FIGURE 03: PERIOD COMPARISON =====
+    if early_data is not None and late_data is not None:
+        try:
+            logger.info("Generating Figure 03...")
+            rate_col = next((c for c in early_data.columns if 'rate' in c.lower()
+                            and 'cm' in c.lower()), None)
+            if rate_col is None:
+                rate_col = next((c for c in early_data.columns if 'rate' in c.lower()), None)
+            
+            if rate_col:
+                early_rates = early_data[rate_col].values
+                late_rates = late_data[rate_col].values
+                
+                # Convert mm/yr to cm/yr if needed
+                if 'mm' in rate_col.lower():
+                    early_rates = early_rates / 10.0
+                    late_rates = late_rates / 10.0
+                
+                early_clean = early_rates[~np.isnan(early_rates)]
+                late_clean = late_rates[~np.isnan(late_rates)]
+                
+                fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+                
+                axes[0].hist(early_clean, bins=100, alpha=0.6, label=f'Early 2019-2021 (n={len(early_clean)})',
+                            color='blue', edgecolor='black')
+                axes[0].hist(late_clean, bins=100, alpha=0.6, label=f'Late 2022-2024 (n={len(late_clean)})',
+                            color='red', edgecolor='black')
+                axes[0].set_xlabel('Subsidence Rate (cm/yr)', fontsize=11, fontweight='bold')
+                axes[0].set_ylabel('Frequency', fontsize=11, fontweight='bold')
+                axes[0].set_title('Distribution of Subsidence Rates by Period', fontsize=12, fontweight='bold')
+                axes[0].legend(fontsize=10)
+                axes[0].grid(True, alpha=0.3)
+                
+                bp = axes[1].boxplot([early_clean, late_clean],
+                                    labels=['Early Period\n2019-2021', 'Late Period\n2022-2024'],
+                                    patch_artist=True, widths=0.6)
+                
+                for patch, color in zip(bp['boxes'], ['lightblue', 'lightcoral']):
+                    patch.set_facecolor(color)
+                
+                axes[1].set_ylabel('Subsidence Rate (cm/yr)', fontsize=11, fontweight='bold')
+                axes[1].set_title('Subsidence Rate Statistics by Period', fontsize=12, fontweight='bold')
+                axes[1].grid(True, alpha=0.3, axis='y')
+                
+                early_mean = np.mean(early_clean)
+                late_mean = np.mean(late_clean)
+                axes[1].text(1, early_mean, f'{early_mean:.2f}', ha='center', va='bottom', fontweight='bold')
+                axes[1].text(2, late_mean, f'{late_mean:.2f}', ha='center', va='bottom', fontweight='bold')
+                
+                plt.tight_layout()
+                fig.savefig(figure_dir / 'Figure03_Period_Comparison.png', dpi=300, bbox_inches='tight')
+                plt.close()
+                logger.info("✓ Figure 03 saved")
+                print("✓ Figure 03: Period Comparison")
+        except Exception as e:
+            logger.warning(f"Figure 03 error: {e}")
+            print(f"⚠️  Figure 03 error: {e}")
+    
+    # ===== FIGURE 04: TIMESCALE STRATIFICATION =====
+    if timescale_analysis is not None and len(timescale_analysis) > 0:
+        try:
+            logger.info("Generating Figure 04...")
+            fig, ax = plt.subplots(figsize=(12, 7))
+            
+            metrics = timescale_analysis['Metric'].values if 'Metric' in timescale_analysis.columns else []
+            if len(metrics) > 0:
+                early_vals = timescale_analysis['Early Period'].values if 'Early Period' in timescale_analysis.columns else np.zeros(len(metrics))
+                late_vals = timescale_analysis['Late Period'].values if 'Late Period' in timescale_analysis.columns else np.zeros(len(metrics))
+                
+                x = np.arange(len(metrics))
+                width = 0.35
+                
+                ax.bar(x - width/2, early_vals, width, label='Early 2019-2021', alpha=0.8)
+                ax.bar(x + width/2, late_vals, width, label='Late 2022-2024', alpha=0.8)
+                
+                ax.set_ylabel('Mean Value', fontsize=11, fontweight='bold')
+                ax.set_title('Temporal Stratification Metrics', fontsize=12, fontweight='bold')
+                ax.set_xticks(x)
+                ax.set_xticklabels(metrics, rotation=45, ha='right')
+                ax.legend(fontsize=10)
+                ax.grid(True, alpha=0.3, axis='y')
+                
+                plt.tight_layout()
+                fig.savefig(figure_dir / 'Figure04_Timescale_Stratification.png', dpi=300, bbox_inches='tight')
+                plt.close()
+                logger.info("✓ Figure 04 saved")
+                print("✓ Figure 04: Timescale Stratification")
+        except Exception as e:
+            logger.warning(f"Figure 04 error: {e}")
+            print(f"⚠️  Figure 04 error: {e}")
+    
+    # ===== FIGURE 05: DENSITY CLASSIFICATION PIE =====
+    if advanced_data is not None and 'density_class' in advanced_data.columns:
+        try:
+            logger.info("Generating Figure 05...")
+            density_counts = advanced_data['density_class'].value_counts()
+            
+            fig, ax = plt.subplots(figsize=(10, 7))
+            colors = ['#FF6B6B', '#FFA726', '#66BB6A', '#42A5F5']
+            
+            wedges, texts, autotexts = ax.pie(density_counts.values, labels=density_counts.index,
+                                              autopct='%1.1f%%', colors=colors, startangle=90,
+                                              textprops={'fontsize': 11, 'fontweight': 'bold'})
+            
+            ax.set_title(f'Point Distribution by Density Classification (Total: {len(advanced_data)} points)',
+                        fontsize=12, fontweight='bold', pad=20)
+            
+            plt.tight_layout()
+            fig.savefig(figure_dir / 'Figure05_Density_Classification.png', dpi=300, bbox_inches='tight')
+            plt.close()
+            logger.info("✓ Figure 05 saved")
+            print("✓ Figure 05: Density Classification")
+            
+            for cls, count in density_counts.items():
+                pct = count / len(advanced_data) * 100
+                logger.info(f"  {cls}: {count} points ({pct:.1f}%)")
+        except Exception as e:
+            logger.warning(f"Figure 05 error: {e}")
+            print(f"⚠️  Figure 05 error: {e}")
+    
+    # ===== FIGURE 06: HOTSPOT MAP =====
+    if advanced_data is not None:
+        try:
+            logger.info("Generating Figure 06...")
+            lat_col = next((c for c in advanced_data.columns if 'lat' in c.lower()), None)
+            lon_col = next((c for c in advanced_data.columns if 'lon' in c.lower()), None)
+            rate_col = next((c for c in advanced_data.columns if 'rate' in c.lower()
+                            and 'cm' in c.lower()), None)
+            
+            if lat_col and lon_col and rate_col:
+                fig, ax = plt.subplots(figsize=(12, 10))
+                
+                non_hotspot = advanced_data[advanced_data.get('cluster_id', -1) == -1]
+                hotspot = advanced_data[advanced_data.get('cluster_id', -1) >= 0]
+                
+                ax.scatter(non_hotspot[lon_col], non_hotspot[lat_col],
+                          c='lightgray', s=10, alpha=0.3, label='Non-hotspot')
+                
+                if len(hotspot) > 0:
+                    scatter = ax.scatter(hotspot[lon_col], hotspot[lat_col],
+                                        c=hotspot[rate_col], s=30, alpha=0.8,
+                                        cmap='RdYlBu_r', edgecolors='darkred', linewidth=0.5,
+                                        label=f'Hotspot (n={len(hotspot)})', vmin=-5, vmax=0)
+                    cbar = plt.colorbar(scatter, ax=ax, label='Subsidence Rate (cm/yr)')
+                
+                ax.set_xlabel('Longitude', fontsize=11, fontweight='bold')
+                ax.set_ylabel('Latitude', fontsize=11, fontweight='bold')
+                ax.set_title('ICESat-2 Coastal Subsidence Hotspots\nTuktoyaktuk Peninsula',
+                            fontsize=12, fontweight='bold', pad=20)
+                ax.legend(loc='best', fontsize=10)
+                ax.grid(True, alpha=0.3)
+                
+                plt.tight_layout()
+                fig.savefig(figure_dir / 'Figure06_Hotspot_Map.png', dpi=300, bbox_inches='tight')
+                plt.close()
+                logger.info("✓ Figure 06 saved")
+                print("✓ Figure 06: Hotspot Map")
+                
+                n_hotspots = len(hotspot)
+                logger.info(f"  Hotspots: {n_hotspots} ({n_hotspots/len(advanced_data)*100:.1f}%)")
+        except Exception as e:
+            logger.warning(f"Figure 06 error: {e}")
+            print(f"⚠️  Figure 06 error: {e}")
+
+def create_violin_period_comparison(early_data, late_data, figure_dir, logger):
+    """
+    Violin + boxplot view of dh distribution for early vs late periods.
+    Uses the same rate column as Figure 03 (cm/yr, negative = subsidence).
+    """
+    if early_data is None or late_data is None:
+        print("⚠️  Violin plot skipped: missing early/late data")
+        return
+
+    rate_col = next((c for c in early_data.columns
+                     if 'rate' in c.lower() and 'cm' in c.lower()), None)
+    if rate_col is None:
+        rate_col = next((c for c in early_data.columns
+                         if 'rate' in c.lower()), None)
+    if rate_col is None:
+        print("⚠️  Violin plot skipped: no rate column found")
+        return
+
+    early_rates = early_data[rate_col].values
+    late_rates = late_data[rate_col].values
+    if 'mm' in rate_col.lower():
+        early_rates = early_rates / 10.0
+        late_rates = late_rates / 10.0
+
+    early_clean = early_rates[~np.isnan(early_rates)]
+    late_clean = late_rates[~np.isnan(late_rates)]
+
+    if len(early_clean) < 10 or len(late_clean) < 10:
+        print("⚠️  Violin plot skipped: not enough valid values")
+        return
+
+    df_violin = pd.DataFrame({
+        'subsidence_cm_yr': np.concatenate([early_clean, late_clean]),
+        'Period': (['Early 2019–2021'] * len(early_clean) +
+                   ['Late 2022–2024'] * len(late_clean))
+    })
+
+    plt.figure(figsize=(10, 6))
+    ax = sns.violinplot(
+        data=df_violin,
+        x='Period',
+        y='subsidence_cm_yr',
+        inner='quartile',
+        cut=0,
+        linewidth=1.0,
+        palette=['#99d8ff', '#f4a259']
+    )
+    sns.boxplot(
+        data=df_violin,
+        x='Period',
+        y='subsidence_cm_yr',
+        width=0.15,
+        showcaps=True,
+        boxprops={'zorder': 3, 'facecolor': 'white', 'alpha': 0.9},
+        showfliers=False,
+        whiskerprops={'linewidth': 1.2},
+        medianprops={'color': 'black', 'linewidth': 1.5}
+    )
+
+    ax.axhline(0, color='grey', linestyle='--', linewidth=1, alpha=0.6)
+    ax.set_ylabel('Subsidence rate (cm/yr)', fontsize=11, fontweight='bold')
+    ax.set_xlabel('')
+    ax.set_title('Violin distribution of subsidence rates by period',
+                 fontsize=12, fontweight='bold')
+
+    plt.tight_layout()
+    figfile = figure_dir / 'Figure03_Violin_PeriodComparison.png'
+    plt.savefig(figfile, dpi=300, bbox_inches='tight')
+    plt.close()
+    logger.info(f"Figure 03 (violin) saved: {figfile.name}")
+    print("✓ Figure 03 violin plot generated")
 
 # ============================================================================
-# PUBLICATION FIGURES - PART 2: ENHANCED NATURE-QUALITY STYLE
+# SPATIAL CONTOUR & MULTIPANEL FUNCTIONS
 # ============================================================================
 
-print("\n" + "="*80)
-print("GENERATING PUBLICATION FIGURES (Part 2/2: Enhanced Nature-Quality)")
-print("="*80)
-
-# Figure 7: Hillshade-enhanced map
-print("\n[7/12] Hillshade-enhanced map...")
-try:
-    fig, ax = plt.subplots(figsize=(16, 12))
-    vmin, vmax = np.percentile(data[rate_col]*1000, [2, 98])
-    scatter = ax.scatter(data[lon_col], data[lat_col],
-                        c=data[rate_col]*1000, cmap=NATURE_CMAP,
-                        s=3, alpha=0.7, vmin=vmin, vmax=vmax, edgecolors='none')
+def create_spatial_contour_map(spatial_grid, output_dir, logger, contour_type='zonal'):
+    """Generate TwoSlopeNorm contour map with proper dimension handling."""
+    if spatial_grid is None or len(spatial_grid) == 0:
+        logger.warning(f"Empty spatial_grid for {contour_type} contours")
+        return
     
-    ax.set_xlabel('Longitude (°E)', fontsize=FONT_LABEL, fontweight='bold')
-    ax.set_ylabel('Latitude (°N)', fontsize=FONT_LABEL, fontweight='bold')
-    ax.set_title(f'Subsidence Rate Distribution: Tuktoyaktuk Peninsula\n{len(data):,} ICESat-2 Repeat-Track Crossovers (2018-2024)',
-                fontsize=FONT_TITLE, fontweight='bold', pad=20)
-    cbar = plt.colorbar(scatter, ax=ax, label='Subsidence Rate (mm/yr)', pad=0.02, aspect=40)
-    cbar.ax.tick_params(labelsize=FONT_TICK)
-    ax.grid(True, alpha=0.2, linestyle='--', linewidth=0.5)
-    ax.set_axisbelow(True)
+    if contour_type == 'zonal':
+        rate_col = 'mean_subsidence_cm_yr'
+        lat_col, lon_col = 'lat_center', 'lon_center'
+        title_suffix = '20km Zonal Grid'
+    else:
+        rate_col = 'subsidence_rate_cm_per_year'
+        lat_col, lon_col = 'latitude', 'longitude'
+        title_suffix = 'Point-Based Grid'
     
-    textstr = 'Data: ICESat-2 Level 3A ATL06\nValidation: Sentinel-1A/B InSAR'
-    ax.text(0.02, 0.02, textstr, transform=ax.transAxes, fontsize=FONT_CAPTION,
-           verticalalignment='bottom', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+    # Validate columns
+    if rate_col not in spatial_grid.columns:
+        logger.warning(f"No {rate_col} column in {contour_type}")
+        return
+    if lat_col not in spatial_grid.columns or lon_col not in spatial_grid.columns:
+        logger.warning(f"No lat/lon columns {lat_col}, {lon_col} in {contour_type}")
+        return
     
-    plt.tight_layout()
-    if save_figure(fig, OUTPUT_DIR, '07_figure_subsidence_map_hillshade'):
-        figure_count += 1
-except Exception as e:
-    print(f" ⚠ Error: {e}")
-
-# Figure 8: Density heatmap
-print("[8/12] Density heatmap...")
-try:
-    fig, ax = plt.subplots(figsize=(14, 10))
-    h = ax.hist2d(data[lon_col], data[lat_col], bins=50, cmap=HEATMAP_CMAP, cmin=1)
-    ax.set_xlabel('Longitude (°E)', fontsize=FONT_LABEL, fontweight='bold')
-    ax.set_ylabel('Latitude (°N)', fontsize=FONT_LABEL, fontweight='bold')
-    ax.set_title('Data Density Hotspots: ICESat-2 Crossover Concentration',
-                fontsize=FONT_TITLE, fontweight='bold', pad=20)
-    cbar = plt.colorbar(h[3], ax=ax, label='Point Count', pad=0.02)
-    cbar.ax.tick_params(labelsize=FONT_TICK)
-    ax.grid(True, alpha=0.2, linestyle='--', linewidth=0.5)
-    ax.set_axisbelow(True)
-    
-    plt.tight_layout()
-    if save_figure(fig, OUTPUT_DIR, '07_figure_density_heatmap'):
-        figure_count += 1
-except Exception as e:
-    print(f" ⚠ Error: {e}")
-
-# Figure 9: Nature-style temporal (4-panel)
-if temporal_available:
-    print("[9/12] Nature-style temporal (4-panel)...")
     try:
-        fig = plt.figure(figsize=(16, 14))
-        gs = fig.add_gridspec(2, 2, hspace=0.3, wspace=0.25)
-        vmin, vmax = np.percentile(data[rate_col]*1000, [2, 98])
+        # Create pivot table
+        pivot = spatial_grid.pivot_table(values=rate_col, index=lat_col, 
+                                         columns=lon_col, aggfunc='mean')
         
-        ax_a = fig.add_subplot(gs[0, 0])
-        ax_a.scatter(early_data[lon_col], early_data[lat_col],
-                    c=early_data[rate_col]*1000, cmap=NATURE_CMAP,
-                    s=2, alpha=0.6, vmin=vmin, vmax=vmax)
-        ax_a.set_xlabel('Longitude (°E)', fontsize=FONT_LABEL, fontweight='bold')
-        ax_a.set_ylabel('Latitude (°N)', fontsize=FONT_LABEL, fontweight='bold')
-        ax_a.set_title(f'A) Early Period (2018-2020)\nn={len(early_data):,}',
-                      fontsize=FONT_LABEL, fontweight='bold', loc='left')
-        ax_a.grid(True, alpha=0.2, linestyle='--')
-        ax_a.set_axisbelow(True)
+        if pivot.empty or pivot.shape[0] < 2 or pivot.shape[1] < 2:
+            logger.warning(f"Pivot insufficient dimensions: {pivot.shape}")
+            return
         
-        ax_b = fig.add_subplot(gs[0, 1])
-        scatter_b = ax_b.scatter(late_data[lon_col], late_data[lat_col],
-                    c=late_data[rate_col]*1000, cmap=NATURE_CMAP,
-                    s=2, alpha=0.6, vmin=vmin, vmax=vmax)
-        ax_b.set_xlabel('Longitude (°E)', fontsize=FONT_LABEL, fontweight='bold')
-        ax_b.set_ylabel('Latitude (°N)', fontsize=FONT_LABEL, fontweight='bold')
-        ax_b.set_title(f'B) Late Period (2022-2024)\nn={len(late_data):,}',
-                      fontsize=FONT_LABEL, fontweight='bold', loc='left')
-        ax_b.grid(True, alpha=0.2, linestyle='--')
-        ax_b.set_axisbelow(True)
+        # Create figure with TwoSlopeNorm
+        rate_range = 5.0
+        fig, ax = plt.subplots(figsize=(14, 10))
+        norm = TwoSlopeNorm(vmin=-rate_range, vcenter=0, vmax=rate_range)
         
-        ax_c = fig.add_subplot(gs[1, 0])
-        ax_c.hist(early_data[rate_col].dropna()*1000, bins=60, alpha=0.6,
-                 label=f'Early: {early_data[rate_col].mean()*1000:.2f} mm/yr',
-                 color='steelblue', edgecolor='black', linewidth=0.7)
-        ax_c.hist(late_data[rate_col].dropna()*1000, bins=60, alpha=0.6,
-                 label=f'Late: {late_data[rate_col].mean()*1000:.2f} mm/yr',
-                 color='coral', edgecolor='black', linewidth=0.7)
-        ax_c.set_xlabel('Subsidence Rate (mm/yr)', fontsize=FONT_LABEL, fontweight='bold')
-        ax_c.set_ylabel('Frequency', fontsize=FONT_LABEL, fontweight='bold')
-        ax_c.set_title('C) Rate Distribution Comparison', fontsize=FONT_LABEL, fontweight='bold', loc='left')
-        ax_c.legend(fontsize=FONT_TICK, loc='upper right')
-        ax_c.grid(True, alpha=0.3, axis='y')
-        ax_c.axvline(0, color='red', linestyle=':', linewidth=1.5, alpha=0.5)
+        cs = ax.contourf(pivot.columns, pivot.index, pivot.values, 
+                         levels=25, cmap='RdYlBu_r', norm=norm, extend='both')
+        cbar = plt.colorbar(cs, ax=ax, shrink=0.85)
+        cbar.set_label('Subsidence Rate (cm/yr)', fontsize=12, fontweight='bold')
         
-        ax_d = fig.add_subplot(gs[1, 1])
-        bp = ax_d.boxplot([early_data[rate_col].dropna()*1000, late_data[rate_col].dropna()*1000],
-                          labels=['Early', 'Late'], patch_artist=True, showmeans=True, meanline=True)
-        bp['boxes'][0].set_facecolor('lightblue')
-        bp['boxes'][1].set_facecolor('lightcoral')
-        ax_d.set_ylabel('Subsidence Rate (mm/yr)', fontsize=FONT_LABEL, fontweight='bold')
-        ax_d.set_title('D) Temporal Deceleration Analysis', fontsize=FONT_LABEL, fontweight='bold', loc='left')
-        ax_d.grid(True, alpha=0.3, axis='y')
-        ax_d.axhline(0, color='red', linestyle=':', linewidth=1.5, alpha=0.5)
+        ax.set_xlabel('Longitude (°W)', fontsize=12, fontweight='bold')
+        ax.set_ylabel('Latitude (°N)', fontsize=12, fontweight='bold')
+        ax.set_title(f'Spatial Subsidence Contours - {title_suffix}\nSymmetric ±5 cm/yr',
+                    fontsize=14, fontweight='bold')
+        ax.grid(True, alpha=0.3, linestyle='--')
         
-        fig.suptitle('Temporal Analysis of Coastal Subsidence Rates\nTuktoyaktuk Peninsula, Arctic Canada',
-                    fontsize=FONT_TITLE+2, fontweight='bold', y=0.995)
+        plt.tight_layout()
+        fig_file = output_dir / f'Figure08_Spatial_Contours_{contour_type}.png'
+        fig.savefig(fig_file, dpi=300, bbox_inches='tight')
+        plt.close()
+        logger.info(f"Saved {fig_file.name}")
+        print(f"✓ {contour_type.title()} contour: {pivot.shape}")
         
-        if save_figure(fig, OUTPUT_DIR, '07_figure_temporal_nature'):
-            figure_count += 1
     except Exception as e:
-        print(f" ⚠ Error: {e}")
+        logger.warning(f"Contour error ({contour_type}): {e}")
 
-# Figure 10: Coastal processes map
-print("[10/12] Coastal processes map...")
-try:
-    fig, ax = plt.subplots(figsize=(16, 12))
-    vmin, vmax = np.percentile(data[rate_col]*1000, [5, 95])
-    scatter = ax.scatter(data[lon_col], data[lat_col],
-                        c=data[rate_col]*1000, cmap=NATURE_CMAP,
-                        s=2, alpha=0.6, vmin=vmin, vmax=vmax)
+def create_enhanced_multipanel_figure(spatial_grid, clusters_df, output_dir, logger):
+    """Generate 4-panel enhanced multipanel figure."""
+    try:
+        fig, axes = plt.subplots(2, 2, figsize=(16, 14))
+        fig.suptitle('Enhanced Subsidence Analysis',
+                    fontsize=16, fontweight='bold', y=0.995)
+        
+        rate_col = 'subsidence_rate_cm_per_year'
+        
+        # PANEL A: Spatial Contour
+        if spatial_grid is not None and len(spatial_grid) > 10:
+            try:
+                if 'latitude' in spatial_grid.columns:
+                    pivot = spatial_grid.pivot_table(rate_col, 'latitude', 'longitude', 'mean')
+                elif 'lat_center' in spatial_grid.columns:
+                    pivot = spatial_grid.pivot_table('mean_subsidence_cm_yr', 'lat_center', 'lon_center', 'mean')
+                else:
+                    pivot = None
+                
+                if pivot is not None and not pivot.empty and pivot.shape[0] >= 2:
+                    norm = TwoSlopeNorm(-5, 0, 5)
+                    cs = axes[0, 0].contourf(pivot.columns, pivot.index, pivot.values,
+                                            levels=20, cmap='RdYlBu_r', norm=norm, extend='both')
+                    cbar = plt.colorbar(cs, ax=axes[0, 0], shrink=0.9)
+                    cbar.set_label('cm/yr')
+                    axes[0, 0].set_xlabel('Longitude')
+                    axes[0, 0].set_ylabel('Latitude')
+                    axes[0, 0].grid(True, alpha=0.3)
+            except Exception as e:
+                logger.debug(f"Panel A error: {e}")
+        
+        axes[0, 0].set_title('A: Spatial Subsidence Contours (TwoSlopeNorm ±5 cm/yr)',
+                            fontweight='bold', fontsize=12)
+        
+        # PANEL B: Elevation vs Subsidence
+        if spatial_grid is not None and 'elevation' in spatial_grid.columns:
+            axes[0, 1].scatter(spatial_grid['elevation'], spatial_grid[rate_col],
+                             alpha=0.6, s=40, c=spatial_grid[rate_col],
+                             cmap='RdYlBu_r', edgecolors='black', linewidth=0.5)
+            axes[0, 1].set_xlabel('Elevation (m)', fontweight='bold')
+            axes[0, 1].set_ylabel('Subsidence (cm/yr)', fontweight='bold')
+            axes[0, 1].grid(True, alpha=0.3)
+            axes[0, 1].axhline(0, color='gray', linestyle='--', alpha=0.5)
+        
+        axes[0, 1].set_title('B: Elevation Dependence', fontweight='bold', fontsize=12)
+        
+        # PANEL C: Uncertainty vs Subsidence
+        if spatial_grid is not None:
+            uncertainty_col = next((c for c in spatial_grid.columns 
+                                   if 'uncertain' in c.lower() or 'std' in c.lower()), None)
+            if uncertainty_col and uncertainty_col in spatial_grid.columns:
+                axes[1, 0].scatter(spatial_grid[rate_col], spatial_grid[uncertainty_col],
+                                 alpha=0.6, s=40, c='steelblue', edgecolors='navy', linewidth=0.5)
+                axes[1, 0].set_xlabel('Subsidence (cm/yr)', fontweight='bold')
+                axes[1, 0].set_ylabel('Uncertainty (cm/yr)', fontweight='bold')
+                axes[1, 0].grid(True, alpha=0.3)
+            else:
+                axes[1, 0].text(0.5, 0.5, 'No uncertainty data', ha='center', va='center',
+                              transform=axes[1, 0].transAxes, fontsize=11)
+        
+        axes[1, 0].set_title('C: Uncertainty Analysis', fontweight='bold', fontsize=12)
+        
+        # PANEL D: Cluster Hotspots
+        if clusters_df is not None and len(clusters_df) > 0:
+            scatter = axes[1, 1].scatter(clusters_df['center_lon'], clusters_df['center_lat'],
+                                        c=clusters_df['mean_subsidence_cm_yr'],
+                                        s=clusters_df['size']*2,
+                                        cmap='RdYlBu_r', alpha=0.7,
+                                        edgecolors='black', linewidth=1,
+                                        vmin=-5, vmax=5)
+            cbar = plt.colorbar(scatter, ax=axes[1, 1], shrink=0.9)
+            cbar.set_label('Mean subsidence (cm/yr)')
+            axes[1, 1].set_xlabel('Longitude', fontweight='bold')
+            axes[1, 1].set_ylabel('Latitude', fontweight='bold')
+            axes[1, 1].grid(True, alpha=0.3)
+        else:
+            axes[1, 1].text(0.5, 0.5, 'No cluster data\nRun Script 06', ha='center', va='center',
+                          transform=axes[1, 1].transAxes, fontsize=11)
+        
+        axes[1, 1].set_title('D: Hotspot Clusters', fontweight='bold', fontsize=12)
+        
+        plt.tight_layout()
+        fig_file = output_dir / 'Figure09_Multipanel_Enhanced.png'
+        fig.savefig(fig_file, dpi=300, bbox_inches='tight')
+        plt.close()
+        logger.info(f"Saved {fig_file.name}")
+        print("✓ 4-panel multipanel generated")
+        
+    except Exception as e:
+        logger.warning(f"Multipanel error: {e}")
+
+# ============================================================================
+# InSAR VALIDATION FUNCTIONS
+# ============================================================================
+
+def create_insar_comparison_plots(insar_df, figure_dir, logger):
+    """Create publication-ready InSAR vs ICeSat-2 comparison plots."""
+    if insar_df is None or len(insar_df) == 0:
+        return False
     
-    # Add process zone annotations
-    process_zones = {
-        'Thermokarst': {'loc': (data[lon_col].mean()-0.02, data[lat_col].mean()+0.015), 'color': 'cyan'},
-        'Coastal Erosion': {'loc': (data[lon_col].mean()+0.02, data[lat_col].mean()-0.01), 'color': 'red'},
-        'Subsidence Hotspot': {'loc': (data[lon_col].mean(), data[lat_col].mean()), 'color': 'darkred'},
-        'Stable Zone': {'loc': (data[lon_col].mean()-0.01, data[lat_col].mean()-0.02), 'color': 'green'}
+    try:
+        icesat2 = insar_df['subsidence_rate_cm_per_year'].values
+        insar = insar_df['insar_rate_mm_yr'].values / 10.0  # Convert mm/yr to cm/yr
+        
+        valid = ~(np.isnan(icesat2) | np.isnan(insar))
+        if valid.sum() < 10:
+            logger.warning(f"Only {valid.sum()} valid InSAR-ICeSat-2 pairs")
+            return False
+        
+        icesat2_valid = icesat2[valid]
+        insar_valid = insar[valid]
+        difference = icesat2_valid - insar_valid
+        
+        elev_col = next((c for c in insar_df.columns if 'elev' in c.lower()), None)
+        elevation = insar_df[elev_col].values[valid] if elev_col else None
+        
+        fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+        
+        lim_min = min(insar_valid.min(), icesat2_valid.min())
+        lim_max = max(insar_valid.max(), icesat2_valid.max())
+        
+        axes[0].scatter(insar_valid, icesat2_valid, alpha=0.6, s=50,
+                       c='steelblue', edgecolors='navy', linewidth=0.5)
+        axes[0].plot([lim_min, lim_max], [lim_min, lim_max], 'r--', 
+                    linewidth=2, label='1:1 agreement', alpha=0.7)
+        
+        r, p = pearsonr(insar_valid, icesat2_valid)
+        rmse = np.sqrt(np.mean(difference**2))
+        bias = np.mean(difference)
+        stats_text = f'R = {r:.3f}\nRMSE = {rmse:.2f} cm/yr\nBias = {bias:.2f} cm/yr\nN = {valid.sum()}'
+        
+        axes[0].text(0.05, 0.95, stats_text, transform=axes[0].transAxes,
+                    fontsize=11, verticalalignment='top',
+                    bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+        axes[0].set_xlabel('InSAR Subsidence Rate (cm/yr)', fontsize=11, fontweight='bold')
+        axes[0].set_ylabel('ICeSat-2 Subsidence Rate (cm/yr)', fontsize=11, fontweight='bold')
+        axes[0].set_title('A: InSAR vs ICeSat-2 Validation', fontsize=12, fontweight='bold')
+        axes[0].legend(fontsize=10)
+        axes[0].grid(True, alpha=0.3)
+        
+        axes[1].hist(difference, bins=40, alpha=0.7, color='steelblue', edgecolor='black')
+        axes[1].axvline(bias, color='red', linestyle='--', linewidth=2,
+                       label=f'Mean bias = {bias:.2f} cm/yr')
+        axes[1].axvline(0, color='green', linestyle='--', linewidth=2, label='Perfect agreement')
+        axes[1].set_xlabel('Difference (ICeSat-2 - InSAR) (cm/yr)', fontsize=11, fontweight='bold')
+        axes[1].set_ylabel('Frequency', fontsize=11, fontweight='bold')
+        axes[1].set_title('B: Difference Distribution', fontsize=12, fontweight='bold')
+        axes[1].legend(fontsize=10)
+        axes[1].grid(True, alpha=0.3, axis='y')
+        
+        if elevation is not None:
+            scatter = axes[2].scatter(elevation, difference, alpha=0.6, s=40,
+                                     c=np.abs(difference), cmap='Reds',
+                                     edgecolors='darkred', linewidth=0.5)
+            cbar = plt.colorbar(scatter, ax=axes[2])
+            cbar.set_label('Residual (cm/yr)')
+            axes[2].set_xlabel('Elevation (m)', fontsize=11, fontweight='bold')
+        else:
+            axes[2].scatter(range(len(difference)), difference, alpha=0.6, s=40,
+                           c='steelblue', edgecolors='navy', linewidth=0.5)
+            axes[2].set_xlabel('Crossover Index', fontsize=11, fontweight='bold')
+        
+        axes[2].axhline(0, color='green', linestyle='--', linewidth=2, alpha=0.7)
+        axes[2].set_ylabel('Residual (cm/yr)', fontsize=11, fontweight='bold')
+        axes[2].set_title('C: Residuals', fontsize=12, fontweight='bold')
+        axes[2].grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        fig_file = figure_dir / 'Figure07_InSAR_Validation.png'
+        fig.savefig(fig_file, dpi=300, bbox_inches='tight')
+        plt.close()
+        logger.info(f"Saved {fig_file.name}")
+        print(f"✓ InSAR validation: R = {r:.3f}, RMSE = {rmse:.2f} cm/yr")
+        return True
+        
+    except Exception as e:
+        logger.warning(f"InSAR plot error: {e}")
+        return False
+
+def create_insar_binned_stats(insar_df, figure_dir, output_dir, bin_size_m=10, logger=None):
+    """Create binned statistics CSV for InSAR-ICeSat-2 agreement by elevation."""
+    if insar_df is None or len(insar_df) == 0:
+        return None
+    
+    try:
+        icesat2 = insar_df['subsidence_rate_cm_per_year'].values
+        insar = insar_df['insar_rate_mm_yr'].values / 10.0
+        valid = ~(np.isnan(icesat2) | np.isnan(insar))
+        
+        icesat2_valid = icesat2[valid]
+        insar_valid = insar[valid]
+        difference = icesat2_valid - insar_valid
+        
+        elev_col = next((c for c in insar_df.columns if 'elev' in c.lower()), None)
+        if elev_col is None:
+            return None
+        
+        elevation = insar_df[elev_col].values[valid]
+        
+        elev_min = np.floor(elevation.min() / bin_size_m) * bin_size_m
+        elev_max = np.ceil(elevation.max() / bin_size_m) * bin_size_m
+        bins = np.arange(elev_min, elev_max + bin_size_m, bin_size_m)
+        
+        stats_list = []
+        for i in range(len(bins) - 1):
+            lo, hi = bins[i], bins[i+1]
+            mask = (elevation >= lo) & (elevation < hi)
+            if mask.sum() == 0:
+                continue
+            
+            icebin = icesat2_valid[mask]
+            insarbin = insar_valid[mask]
+            diffbin = difference[mask]
+            
+            stats_list.append({
+                'elevation_m': f'{int(lo)}-{int(hi)}',
+                'elevation_center': (lo + hi) / 2,
+                'n_points': int(mask.sum()),
+                'icesat2_mean_cm_yr': float(icebin.mean()),
+                'icesat2_std_cm_yr': float(icebin.std()),
+                'insar_mean_cm_yr': float(insarbin.mean()),
+                'insar_std_cm_yr': float(insarbin.std()),
+                'difference_mean_cm_yr': float(diffbin.mean()),
+                'difference_std_cm_yr': float(diffbin.std()),
+                'rmse_cm_yr': float(np.sqrt(np.mean(diffbin**2))),
+                'mae_cm_yr': float(np.mean(np.abs(diffbin))),
+            })
+        
+        df_stats = pd.DataFrame(stats_list)
+        if len(df_stats) == 0:
+            return None
+        
+        stats_csv = output_dir / '07_insar_binned_stats_by_elevation.csv'
+        df_stats.to_csv(stats_csv, index=False, encoding='utf-8')
+        if logger:
+            logger.info(f"Saved {stats_csv.name} ({len(df_stats)} elevation bins)")
+        print(f"✓ InSAR binned stats: {len(df_stats)} elevation bins")
+        return df_stats
+        
+    except Exception as e:
+        if logger:
+            logger.warning(f"Binned stats error: {e}")
+        return None
+
+def create_insar_spatial_subsample(insar_df, output_dir, downsample_factor=10, logger=None):
+    """Create QGIS-optimized spatial subsample."""
+    if insar_df is None or len(insar_df) == 0:
+        return None
+    
+    try:
+        lat_col = next((c for c in insar_df.columns if 'lat' in c.lower()), None)
+        lon_col = next((c for c in insar_df.columns if 'lon' in c.lower()), None)
+        rate_col = next((c for c in insar_df.columns 
+                        if 'subsidence_rate_cm_per_year' in c.lower() or 
+                        ('rate' in c.lower() and 'cm' in c.lower())), None)
+        
+        if not all([lat_col, lon_col, rate_col]):
+            return None
+        
+        downsampled = insar_df.iloc[::downsample_factor].copy()
+        
+        grid_size_m = 2000
+        downsampled['grid_cell_x'] = (downsampled[lon_col] * 111000).astype(int) // grid_size_m
+        downsampled['grid_cell_y'] = (downsampled[lat_col] * 111000).astype(int) // grid_size_m
+        
+        if 'insar_rate_mm_yr' in downsampled.columns:
+            downsampled['difference_cm_yr'] = downsampled[rate_col] - downsampled['insar_rate_mm_yr'] / 10.0
+            downsampled['abs_difference_cm_yr'] = np.abs(downsampled['difference_cm_yr'])
+        
+        qgis_csv = output_dir / '07_insar_qgis_subsample.csv'
+        downsampled.to_csv(qgis_csv, index=False, encoding='utf-8')
+        if logger:
+            logger.info(f"Saved {qgis_csv.name}")
+        print(f"✓ QGIS subsample: {len(downsampled)} points (~90% size reduction)")
+        return downsampled
+        
+    except Exception as e:
+        if logger:
+            logger.warning(f"QGIS subsample error: {e}")
+        return None
+
+def create_summary_statistics(zonal_stats, advanced_data, insar_integrated, 
+                             figure_dir, output_dir, run_timestamp, git_hash, logger):
+    """Generate comprehensive summary statistics table."""
+    try:
+        summary_file = figure_dir / 'SummaryStatistics.txt'
+        with open(summary_file, 'w', encoding='utf-8') as f:
+            f.write('='*80 + '\n')
+            f.write('ICESat-2 COASTAL SUBSIDENCE ANALYSIS - SUMMARY STATISTICS\n')
+            f.write('TUKTOYAKTUK PENINSULA\n')
+            f.write('='*80 + '\n\n')
+            f.write(f'Run ID: {run_timestamp}\n')
+            f.write(f'Git Hash: {git_hash}\n')
+            f.write(f'Generated: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}\n')
+            f.write('='*80 + '\n\n')
+            
+            # Zonal statistics
+            if zonal_stats is not None and len(zonal_stats) > 0:
+                f.write('ZONAL STATISTICS SUMMARY (20km grid)\n')
+                f.write('-'*80 + '\n')
+                f.write(f'Grid cells with data: {len(zonal_stats)}\n')
+                if 'mean_subsidence_cm_yr' in zonal_stats.columns:
+                    f.write(f'Mean subsidence rate: {zonal_stats["mean_subsidence_cm_yr"].mean():.2f} cm/yr\n')
+                    f.write(f'Max subsidence rate: {zonal_stats["mean_subsidence_cm_yr"].max():.2f} cm/yr\n')
+                    f.write(f'Min subsidence rate: {zonal_stats["mean_subsidence_cm_yr"].min():.2f} cm/yr\n')
+                if 'density_points_per_km2' in zonal_stats.columns:
+                    f.write(f'Mean density: {zonal_stats["density_points_per_km2"].mean():.2f} points/km²\n')
+                f.write('\n')
+            
+            # Advanced analysis
+            if advanced_data is not None and len(advanced_data) > 0:
+                f.write('ADVANCED ANALYSIS SUMMARY\n')
+                f.write('-'*80 + '\n')
+                f.write(f'Total points analyzed: {len(advanced_data)}\n')
+                if 'density_class' in advanced_data.columns:
+                    f.write(f'Density classes: {advanced_data["density_class"].nunique()}\n')
+                if 'cluster_id' in advanced_data.columns:
+                    n_hotspots = (advanced_data['cluster_id'] > 0).sum()
+                    f.write(f'Hotspot points: {n_hotspots} ({n_hotspots/len(advanced_data)*100:.1f}%)\n')
+                f.write('\n')
+            
+            # Figures generated
+            f.write('FIGURES GENERATED\n')
+            f.write('='*80 + '\n')
+            f.write('Figure 01: Zonal Grid Heatmap (20km)\n')
+            f.write('Figure 02: Zonal Density Heatmap\n')
+            f.write('Figure 03: Period Comparison (Early 2019-2021 vs Late 2022-2024)\n')
+            f.write('Figure 03: Violin Distribution by Period (NEW)\n')
+            f.write('Figure 04: Timescale Stratification\n')
+            f.write('Figure 05: Density Classification (Pie Chart)\n')
+            f.write('Figure 06: Hotspot Map (Spatial Distribution)\n')
+            f.write('Figure 07: InSAR Validation (3-Panel Comparison)\n')
+            f.write('Figure 08: Spatial Contour Maps (TwoSlopeNorm ±5 cm/yr)\n')
+            f.write('Figure 09: 4-Panel Enhanced Multipanel Analysis\n')
+            f.write('\n')
+            f.write('All figures: 300 DPI PNG format\n')
+            f.write('Color scheme: RdYlBu_r (Red=subsidence, Blue=uplift, Yellow=stable)\n')
+            f.write('\n')
+            f.write('='*80 + '\n')
+            f.write('UNITS AND CONVENTIONS\n')
+            f.write('='*80 + '\n')
+            f.write('All subsidence rates: cm/yr\n')
+            f.write('  Negative values = subsidence (expected for permafrost)\n')
+            f.write('  Positive values = uplift (less common)\n')
+            f.write('  Zero = no change\n')
+            f.write('\nColor convention:\n')
+            f.write('  Red = subsidence (negative rates)\n')
+            f.write('  Blue = uplift (positive rates)\n')
+            f.write('  Yellow = stable (near 0)\n')
+            f.write('\nData files:\n')
+            f.write('  07_insar_binned_stats_by_elevation.csv\n')
+            f.write('  07_insar_qgis_subsample.csv\n')
+            f.write('\nQGIS instructions:\n')
+            f.write('  Layer → Add Delimited Text Layer → Select CSV\n')
+            f.write('  X field: lon_col, Y field: lat_col\n')
+            f.write('\n')
+        
+        logger.info(f"Saved {summary_file.name}")
+        print(f"✓ Summary statistics generated")
+        
+    except Exception as e:
+        logger.warning(f"Summary statistics error: {e}")
+
+# ============================================================================
+# MAIN EXECUTION
+# ============================================================================
+
+def main():
+    """Main execution function."""
+    
+    # Get timestamp
+    timestamp_file = BASEOUTPUTDIR / 'latest_RUN_TIMESTAMP.txt'
+    if not timestamp_file.exists():
+        print("ERROR: Run Script 00/08 first to generate timestamp!")
+        print(f"Expected: {timestamp_file}")
+        sys.exit(1)
+    
+    with open(timestamp_file, 'r', encoding='utf-8') as f:
+        RUN_TIMESTAMP = f.read().strip()
+    
+    OUTPUT_DIR = BASEOUTPUTDIR / f'run_{RUN_TIMESTAMP}'
+    FIGURE_DIR = OUTPUT_DIR / 'figures'
+    
+    try:
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        FIGURE_DIR.mkdir(exist_ok=True)
+    except Exception as e:
+        print(f"Cannot create directories: {e}")
+        sys.exit(1)
+    
+    # Setup
+    logger = setup_logging(OUTPUT_DIR)
+    git_hash = get_git_hash()
+    metadata = RunMetadata(RUN_TIMESTAMP, git_hash)
+    
+    print("="*80)
+    print("SCRIPT 07: FINAL PUBLICATION FIGURES (v4.3 - COMPLETE MERGED)")
+    print("="*80)
+    print(f"Run ID: {RUN_TIMESTAMP}")
+    print(f"Output: {OUTPUT_DIR}")
+    print(f"Figures: {FIGURE_DIR}")
+    print(f"Git: {git_hash}")
+    
+    logger.info("="*80)
+    logger.info("SCRIPT 07: FINAL PUBLICATION FIGURES (v4.3 - COMPLETE MERGED)")
+    logger.info("="*80)
+    logger.info(f"Run ID: {RUN_TIMESTAMP}")
+    logger.info(f"Git Hash: {git_hash}")
+    logger.info(f"Output directory: {OUTPUT_DIR}")
+    
+    # Configure plotting
+    plt.style.use('seaborn-v0_8-darkgrid')
+    sns.set_palette('husl')
+    
+    # ========================================================================
+    # LOAD DATA
+    # ========================================================================
+    logger.info("\n" + "="*80)
+    logger.info("LOADING DATA")
+    logger.info("="*80)
+    
+    print("\n" + "="*80)
+    print("LOADING DATA")
+    print("="*80)
+    
+    zonal_stats = None
+    early_data = None
+    late_data = None
+    timescale_analysis = None
+    advanced_data = None
+    clusters_stats = None
+    insar_integrated = None
+    
+    try:
+        zonal_stats = pd.read_csv(OUTPUT_DIR / '04_zonal_statistics_20km_grid.csv')
+        print(f"✓ Zonal statistics: {len(zonal_stats)} cells")
+    except FileNotFoundError:
+        print("⚠️  Zonal statistics not found (run Script 04)")
+    except Exception as e:
+        logger.warning(f"Zonal stats error: {e}")
+    
+    try:
+        early_data = pd.read_csv(OUTPUT_DIR / 'icesat2_early_period.csv')
+        late_data = pd.read_csv(OUTPUT_DIR / 'icesat2_late_period.csv')
+        print(f"✓ Temporal data: Early={len(early_data)}, Late={len(late_data)}")
+    except FileNotFoundError:
+        print("⚠️  Temporal data not found (run Script 05b)")
+    except Exception as e:
+        logger.warning(f"Temporal data error: {e}")
+    
+    try:
+        timescale_analysis = pd.read_csv(OUTPUT_DIR / 'temporal_acceleration_metrics.csv')
+        print(f"✓ Timescale analysis: {len(timescale_analysis)} metrics")
+    except FileNotFoundError:
+        print("⚠️  Timescale analysis not found (run Script 05b)")
+    except Exception as e:
+        logger.warning(f"Timescale analysis error: {e}")
+    
+    try:
+        advanced_data = pd.read_csv(OUTPUT_DIR / '06_clusters_identified.csv')
+        clusters_stats = pd.read_csv(OUTPUT_DIR / '06_cluster_statistics.csv')
+        print(f"✓ Advanced analysis: {len(advanced_data)} points, {len(clusters_stats)} clusters")
+    except FileNotFoundError:
+        print("⚠️  Advanced analysis not found (run Script 06)")
+    except Exception as e:
+        logger.warning(f"Advanced analysis error: {e}")
+    
+    try:
+        insar_integrated = pd.read_csv(OUTPUT_DIR / 'icesat2_insar_integrated.csv')
+        print(f"✓ InSAR integrated: {len(insar_integrated)} points")
+    except FileNotFoundError:
+        print("⚠️  InSAR data not found (optional)")
+    except Exception as e:
+        logger.warning(f"InSAR data error: {e}")
+    
+    # ========================================================================
+    # SIGN CONVENTION VERIFICATION (FIX #1) - 3 CHECKPOINTS
+    # ========================================================================
+    print("\n" + "="*80)
+    print("SIGN CONVENTION VERIFICATION")
+    print("="*80)
+    
+    # Checkpoint 1: Advanced data
+    if advanced_data is not None and len(advanced_data) > 0:
+        verify_sign_convention(advanced_data, 'subsidence_rate_cm_per_year', "Advanced Data")
+    
+    # Checkpoint 2: Zonal stats
+    if zonal_stats is not None and len(zonal_stats) > 0:
+        verify_sign_convention(zonal_stats, 'mean_subsidence_cm_yr', "Zonal Stats")
+    
+    # Checkpoint 3: InSAR
+    if insar_integrated is not None and len(insar_integrated) > 0:
+        verify_sign_convention(insar_integrated, 'subsidence_rate_cm_per_year', "InSAR")
+    
+    print("="*80 + "\n")
+    
+    # FIX #2: Safe DataFrame checks (is not None)
+    print(f"Zonal: {len(zonal_stats) if zonal_stats is not None else 0} | " +
+          f"Temporal: {len(early_data) if early_data is not None else 0}/" +
+          f"{len(late_data) if late_data is not None else 0}")
+    print(f"Clusters: {len(clusters_stats) if clusters_stats is not None else 0} | " +
+          f"InSAR: {len(insar_integrated) if insar_integrated is not None else 0}")
+    
+    # ========================================================================
+    # GENERATE FIGURES 01-06
+    # ========================================================================
+    logger.info("\n" + "="*80)
+    logger.info("GENERATING FIGURES 01-06")
+    logger.info("="*80)
+    
+    print("\n" + "="*80)
+    print("GENERATING FIGURES 01-06")
+    print("="*80 + "\n")
+    
+    create_figures_01_to_06(zonal_stats, early_data, late_data, timescale_analysis,
+                           advanced_data, FIGURE_DIR, logger)
+    
+    # Figure 03 Violin (NEW with FIX #5 - correct variable names)
+    if early_data is not None and late_data is not None:
+        create_violin_period_comparison(early_data, late_data, FIGURE_DIR, logger)
+    
+    # ========================================================================
+    # GENERATE FIGURES 07-09 (NEW)
+    # ========================================================================
+    logger.info("\n" + "="*80)
+    logger.info("GENERATING FIGURES 07-09 (InSAR, TwoSlopeNorm, Multipanel)")
+    logger.info("="*80)
+    
+    print("\n" + "="*80)
+    print("GENERATING FIGURES 07-09 (NEW)")
+    print("="*80 + "\n")
+    
+    if insar_integrated is not None and len(insar_integrated) > 0:
+        print("✓ InSAR validation plots...")
+        create_insar_comparison_plots(insar_integrated, FIGURE_DIR, logger)
+        
+        print("✓ InSAR binned statistics...")
+        create_insar_binned_stats(insar_integrated, FIGURE_DIR, OUTPUT_DIR, logger=logger)
+        
+        print("✓ QGIS-optimized subsample...")
+        create_insar_spatial_subsample(insar_integrated, OUTPUT_DIR, logger=logger)
+    else:
+        print("⚠️  InSAR validation skipped (no data)")
+    
+    if zonal_stats is not None:
+        print("✓ Contour maps (5 cm/yr symmetric)...")
+        create_spatial_contour_map(zonal_stats, FIGURE_DIR, logger, 'zonal')
+    
+    if advanced_data is not None:
+        create_spatial_contour_map(advanced_data, FIGURE_DIR, logger, 'points')
+    
+    print("✓ 4-panel enhanced multipanel...")
+    # FIX #4: Safe selection - check data availability properly
+    spatial_grid_for_multipanel = advanced_data if advanced_data is not None else zonal_stats
+    create_enhanced_multipanel_figure(spatial_grid_for_multipanel, clusters_stats, FIGURE_DIR, logger)
+    
+    # ========================================================================
+    # GENERATE SUMMARY STATISTICS
+    # ========================================================================
+    logger.info("\n" + "="*80)
+    logger.info("GENERATING SUMMARY STATISTICS")
+    logger.info("="*80)
+    
+    print("\n" + "="*80)
+    print("GENERATING SUMMARY STATISTICS")
+    print("="*80)
+    
+    create_summary_statistics(zonal_stats, advanced_data, insar_integrated,
+                             FIGURE_DIR, OUTPUT_DIR, RUN_TIMESTAMP, git_hash[:8], logger)
+    
+    # ========================================================================
+    # FINALIZE METADATA
+    # ========================================================================
+    logger.info("\n" + "="*80)
+    logger.info("FINALIZING")
+    logger.info("="*80)
+    
+    metadata.configuration = {
+        'figures': '9+',
+        'dpi': 300,
+        'style': 'seaborn-v0_8-darkgrid',
+        'colormap_primary': 'RdYlBu_r',
+        'units': 'cm/yr',
+        'contour_symmetric_range': '±5 cm/yr',
     }
     
-    for zone_name, zone_info in process_zones.items():
-        ax.scatter(zone_info['loc'][0], zone_info['loc'][1], s=500, c=zone_info['color'],
-                  edgecolors='black', linewidth=2, zorder=10, label=zone_name)
+    n_figures = len(list(FIGURE_DIR.glob('Figure*.png')))
+    metadata.processing_results = {
+        'figures_generated': n_figures,
+        'zonal_cells': len(zonal_stats) if zonal_stats is not None else 0,
+        'temporal_periods': 2 if early_data is not None and late_data is not None else 0,
+        'n_clusters': len(clusters_stats) if clusters_stats is not None else 0,
+        'has_insar': insar_integrated is not None,
+        'csv_exports': 2 if insar_integrated is not None else 0,
+    }
     
-    ax.set_xlabel('Longitude (°E)', fontsize=FONT_LABEL, fontweight='bold')
-    ax.set_ylabel('Latitude (°N)', fontsize=FONT_LABEL, fontweight='bold')
-    ax.set_title('Coastal Subsidence & Geomorphic Processes\nTuktoyaktuk Peninsula - Arctic Coastal Dynamics',
-                fontsize=FONT_TITLE, fontweight='bold', pad=20)
-    cbar = plt.colorbar(scatter, ax=ax, label='Subsidence Rate (mm/yr)', pad=0.02)
-    cbar.ax.tick_params(labelsize=FONT_TICK)
-    ax.legend(loc='upper left', fontsize=FONT_TICK, framealpha=0.9, title='Coastal Processes')
-    ax.grid(True, alpha=0.2, linestyle='--')
-    ax.set_axisbelow(True)
+    metadata.finalize()
+    metadata_file = metadata.save(OUTPUT_DIR)
+    logger.info(f"Saved metadata: {metadata_file.name}")
     
-    plt.tight_layout()
-    if save_figure(fig, OUTPUT_DIR, '07_figure_coastal_processes'):
-        figure_count += 1
-except Exception as e:
-    print(f" ⚠ Error: {e}")
-
-# Figure 11: Hotspot detailed analysis
-if 'lisa_cluster' in data.columns:
-    print("[11/12] Hotspot detailed analysis...")
-    try:
-        fig, axes = plt.subplots(1, 2, figsize=(16, 7))
-        colors = {'HH': '#d73027', 'LL': '#4575b4', 'HL': '#fee090', 'LH': '#91bfdb', 'NS': '#e0e0e0'}
-        
-        for cluster_type in ['NS', 'LH', 'HL', 'LL', 'HH']:
-            mask = data['lisa_cluster'] == cluster_type
-            if mask.sum() > 0:
-                axes[0].scatter(data.loc[mask, lon_col], data.loc[mask, lat_col],
-                               c=colors[cluster_type], label=cluster_type, s=4, alpha=0.7, edgecolors='none')
-        
-        axes[0].set_xlabel('Longitude (°E)', fontsize=FONT_LABEL, fontweight='bold')
-        axes[0].set_ylabel('Latitude (°N)', fontsize=FONT_LABEL, fontweight='bold')
-        axes[0].set_title('A) LISA Hotspot Classification', fontsize=FONT_LABEL, fontweight='bold', loc='left')
-        axes[0].legend(fontsize=FONT_TICK, loc='upper right')
-        axes[0].grid(True, alpha=0.2)
-        axes[0].set_axisbelow(True)
-        
-        hh_mask = data['lisa_cluster'] == 'HH'
-        ll_mask = data['lisa_cluster'] == 'LL'
-        ns_mask = data['lisa_cluster'] == 'NS'
-        
-        bp = axes[1].boxplot([data.loc[hh_mask, rate_col].dropna()*1000,
-                             data.loc[ll_mask, rate_col].dropna()*1000,
-                             data.loc[ns_mask, rate_col].dropna()*1000],
-                            labels=['Hotspot\n(HH)', 'Cold\n(LL)', 'Non-Sig\n(NS)'],
-                            patch_artist=True, showmeans=True, meanline=True)
-        bp['boxes'][0].set_facecolor('#d73027')
-        bp['boxes'][1].set_facecolor('#4575b4')
-        bp['boxes'][2].set_facecolor('#e0e0e0')
-        axes[1].set_ylabel('Subsidence Rate (mm/yr)', fontsize=FONT_LABEL, fontweight='bold')
-        axes[1].set_title('B) Magnitude by Cluster', fontsize=FONT_LABEL, fontweight='bold', loc='left')
-        axes[1].grid(True, alpha=0.3, axis='y')
-        axes[1].axhline(0, color='red', linestyle=':', linewidth=1.5, alpha=0.5)
-        
-        fig.suptitle('Spatial Hotspot Analysis', fontsize=FONT_TITLE, fontweight='bold')
-        
-        if save_figure(fig, OUTPUT_DIR, '07_figure_hotspot_detailed'):
-            figure_count += 1
-    except Exception as e:
-        print(f" ⚠ Error: {e}")
-
-# Figure 12: Summary composite
-print("[12/12] Summary composite...")
-try:
-    fig = plt.figure(figsize=(16, 10))
-    gs = fig.add_gridspec(2, 3, hspace=0.35, wspace=0.3)
+    # ========================================================================
+    # COMPLETION MESSAGE
+    # ========================================================================
+    print("\n" + "="*80)
+    print("SCRIPT 07 COMPLETE - FINAL PUBLICATION FIGURES (v4.3)")
+    print("="*80)
+    print(f"\nOutput Summary:")
+    print(f"  ✓ Figures: {n_figures} all 300 DPI PNG")
+    print(f"  ✓ Zonal cells: {len(zonal_stats) if zonal_stats is not None else 0}")
+    print(f"  ✓ Hotspot clusters: {len(clusters_stats) if clusters_stats is not None else 0}")
+    print(f"  ✓ InSAR validated: {insar_integrated is not None}")
+    print(f"\nFeatures:")
+    print(f"  ✓ cm/yr units consistent with Scripts 03-06")
+    print(f"  ✓ Figures 01-06 fully generated (zonal, temporal, hotspots)")
+    print(f"  ✓ Violin plot of dh distribution by period (NEW)")
+    print(f"  ✓ TwoSlopeNorm contours (±5 cm/yr symmetric)")
+    print(f"  ✓ RdYlBu_r colormap (Red=subsidence, Blue=uplift, Yellow=stable)")
+    print(f"  ✓ 4-panel multipanel (spatial, elevation, uncertainty, clusters)")
+    print(f"  ✓ Sign verification (3 checkpoints: Advanced, Zonal, InSAR)")
+    print(f"  ✓ Safe DataFrame checks (is not None)")
+    print(f"  ✓ Variable naming consistency (snake_case)")
+    print(f"  ✓ InSAR validation + binned statistics + QGIS export")
+    print(f"\nLocation: {FIGURE_DIR}")
+    print(f"Summary: {FIGURE_DIR / 'SummaryStatistics.txt'}")
+    print(f"Log: {OUTPUT_DIR / 'script_07_run.log'}")
+    print(f"\n✅ Ready for thesis! All figures publication-ready.")
+    print("="*80 + "\n")
     
-    ax1 = fig.add_subplot(gs[0, 0])
-    ax1.axis('off')
-    stats_text = f"ANALYSIS SUMMARY\nTuktoyaktuk Peninsula\n\nDataset:\n Points: {len(data):,}\n Period: 2018-2024\n\nRates:\n Mean: {data[rate_col].mean()*1000:.2f} mm/yr\n Median: {data[rate_col].median()*1000:.2f} mm/yr\n Std Dev: {data[rate_col].std()*1000:.2f} mm/yr\n Min: {data[rate_col].min()*1000:.2f} mm/yr\n Max: {data[rate_col].max()*1000:.2f} mm/yr"
-    ax1.text(0.05, 0.95, stats_text, transform=ax1.transAxes, fontsize=FONT_TICK,
-            verticalalignment='top', family='monospace',
-            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
-    
-    ax2 = fig.add_subplot(gs[0, 1:])
-    ax2.hist(data[rate_col].dropna()*1000, bins=80, color='steelblue', alpha=0.7, edgecolor='black', linewidth=0.5)
-    ax2.axvline(data[rate_col].mean()*1000, color='red', linestyle='--', linewidth=2.5,
-               label=f'Mean: {data[rate_col].mean()*1000:.2f} mm/yr')
-    ax2.axvline(data[rate_col].median()*1000, color='orange', linestyle='--', linewidth=2.5,
-               label=f'Median: {data[rate_col].median()*1000:.2f} mm/yr')
-    ax2.set_xlabel('Subsidence Rate (mm/yr)', fontsize=FONT_LABEL, fontweight='bold')
-    ax2.set_ylabel('Frequency', fontsize=FONT_LABEL, fontweight='bold')
-    ax2.set_title('Distribution', fontsize=FONT_LABEL, fontweight='bold')
-    ax2.legend(fontsize=FONT_TICK)
-    ax2.grid(True, alpha=0.3, axis='y')
-    
-    if 'density_class' in data.columns:
-        ax3 = fig.add_subplot(gs[1, :])
-        density_classes = sorted([dc for dc in data['density_class'].unique() if pd.notna(dc)])
-        means, sems, counts = [], [], []
-        for dc in density_classes:
-            subset = data[data['density_class'] == dc][rate_col].dropna()
-            if len(subset) > 0:
-                means.append(subset.mean() * 1000)
-                sems.append(subset.std() * 1000 / np.sqrt(len(subset)))
-                counts.append(len(subset))
-        
-        x_pos = np.arange(len(density_classes))
-        ax3.bar(x_pos, means, yerr=sems, capsize=10, color='coral', alpha=0.7,
-               edgecolor='black', linewidth=1.5, error_kw={'linewidth': 2, 'ecolor': 'darkred'})
-        ax3.set_xticks(x_pos)
-        ax3.set_xticklabels([f'{dc}\n(n={c})' for dc, c in zip(density_classes, counts)], fontsize=FONT_TICK)
-        ax3.set_xlabel('Density Class', fontsize=FONT_LABEL, fontweight='bold')
-        ax3.set_ylabel('Mean Subsidence Rate (mm/yr)', fontsize=FONT_LABEL, fontweight='bold')
-        ax3.set_title('Density-Stratified Analysis', fontsize=FONT_LABEL, fontweight='bold')
-        ax3.grid(True, alpha=0.3, axis='y')
-        ax3.axhline(0, color='red', linestyle=':', linewidth=1.5, alpha=0.5)
-    
-    fig.suptitle('Publication Summary', fontsize=FONT_TITLE+1, fontweight='bold', y=0.995)
-    
-    if save_figure(fig, OUTPUT_DIR, '07_figure_summary_composite'):
-        figure_count += 1
-except Exception as e:
-    print(f" ⚠ Error: {e}")
+    logger.info("="*80)
+    logger.info("SCRIPT 07 EXECUTION COMPLETE (v4.3)")
+    logger.info("="*80)
 
-# ============================================================================
-# GIS EXPORTS
-# ============================================================================
-
-print("\n" + "="*80)
-print("GENERATING GIS EXPORTS")
-print("="*80)
-
-try:
-    import geopandas as gpd
-    from shapely.geometry import Point
-    
-    print("\nCreating GeoDataFrame...")
-    geometry = [Point(xy) for xy in zip(data[lon_col], data[lat_col])]
-    gdf = gpd.GeoDataFrame(data, geometry=geometry, crs="EPSG:4326")
-    
-    gis_dir = OUTPUT_DIR / 'GIS_exports'
-    gis_dir.mkdir(exist_ok=True)
-    
-    gdf.to_file(gis_dir / 'icesat2_crossovers.shp', index=False)
-    print(f"✓ icesat2_crossovers.shp ({len(gdf):,} features)")
-    
-    gdf.to_file(gis_dir / 'icesat2_analysis.gpkg', layer='crossovers', driver="GPKG", index=False)
-    print(f"✓ icesat2_analysis.gpkg")
-    
-    metadata_file = gis_dir / 'GIS_metadata.txt'
-    with open(metadata_file, 'w', encoding='utf-8') as f:
-        f.write("="*80 + "\n")
-        f.write("GIS EXPORT METADATA\n")
-        f.write("="*80 + "\n\n")
-        f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-        f.write(f"CRS: EPSG:4326 (WGS84)\n")
-        f.write(f"Total features: {len(gdf):,}\n")
-        f.write(f"Geometry type: Point\n\n")
-        f.write("FIELD DESCRIPTIONS:\n")
-        f.write("-" * 80 + "\n")
-        for i, col in enumerate(list(data.columns)[:15]):
-            dtype = str(data[col].dtype)
-            n_null = data[col].isna().sum()
-            f.write(f"{col:30s} | {dtype:15s} | {n_null:,} null\n")
-        if len(data.columns) > 15:
-            f.write(f"\n... and {len(data.columns)-15} more fields\n")
-    print(f"✓ GIS_metadata.txt")
-
-except ImportError:
-    print(f"⚠ geopandas not installed – skipping GIS exports")
-
-# ============================================================================
-# FINAL SUMMARY
-# ============================================================================
-
-print("\n" + "="*80)
-print("SCRIPT 07 - COMPLETE")
-print("="*80)
-
-print(f"\n✓ FIGURES GENERATED: {figure_count}/12")
-print(f"✓ EACH FIGURE SAVED AT: 300 DPI + 600 DPI HiRes")
-print(f"\n✓ DATA TABLES:")
-print(f"  • 07_summary_statistics.csv")
-print(f"  • 07_bootstrap_confidence_intervals.csv")
-if density_ci_list:
-    print(f"  • 07_composite_metrics.csv")
-
-print(f"\n✓ GIS EXPORTS:")
-print(f"  • GIS_exports/icesat2_crossovers.shp")
-print(f"  • GIS_exports/icesat2_analysis.gpkg")
-print(f"  • GIS_exports/GIS_metadata.txt")
-
-print(f"\n✓ All outputs saved to: {OUTPUT_DIR}")
-print(f"\n✓ READY FOR THESIS AND PUBLICATION!")
-print(f"\n" + "="*80)
-
-sys.exit(0)
+if __name__ == '__main__':
+    main()

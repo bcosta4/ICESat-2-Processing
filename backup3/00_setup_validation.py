@@ -1,171 +1,141 @@
 """
-SCRIPT 00: SETUP VALIDATION & ENVIRONMENT CHECK
-
-Purpose
--------
-Validate the computational environment before any ICESat-2 processing.
-This script ensures all required Python packages are installed, verifies
-directory structure and configuration paths, and initializes the run
-timestamp used by all downstream scripts.
-
-Origin / Consolidation
-----------------------
-- Consolidates: 00_check_packages.py + 00_validate_scripts.py
-- No processing logic from later scripts is executed here.
-
-Main Tasks
-----------
-- Check presence and version of required packages:
-  pandas, numpy, scipy, matplotlib, geopandas, rasterio,
-  laspy, shapely, scikit-learn, pyproj, etc.
-- Verify paths such as:
-  - BASE_OUTPUT_DIR (e.g. E:\\Processing\\ICESat-2\\output_data)
-  - INPUT_DIR (raw ATL03 data)
-  - INSAR_DIR (InSAR GeoTIFFs)
-  - CANADA_LAND_SHAPEFILE, CANVEC_WATERBODY_SHAPEFILE (GIS layers)
-- Create output directory structure if missing.
-- Confirm read/write access to all configured locations.
-- Create or update `latest_run_timestamp.txt` that identifies the
-  current processing run (e.g. 20260105_n1).
-
-Inputs
-------
-- System environment and installed Python packages.
-- Configuration constants defined in this script (paths, etc.).
-
-Outputs
--------
-- latest_run_timestamp.txt  (used by Scripts 01–06)
-- Console log summarizing:
-  - Package versions
-  - Path checks
-  - Any missing dependencies
-
-Reproducibility Notes
----------------------
-Run this script once before any other script in the workflow. If this
-script fails, do not proceed, as downstream outputs would not be
-reproducible or may be incomplete.
+SCRIPT 00: SETUP & VALIDATION WITH CORRECTED AUTO-INCREMENT TIMESTAMP
+Generates daily auto-incrementing run IDs (YYYYMMDD_n1, n2, etc.)
 """
 
-import importlib
+import os
 from pathlib import Path
+from datetime import datetime
 import sys
-import datetime as dt
+import io
 
-print("=" * 80)
-print("SCRIPT 00: ENVIRONMENT SETUP & VALIDATION (MINIMAL)")
-print("=" * 80)
+if sys.stdout.encoding != 'utf-8':
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+if sys.stderr.encoding != 'utf-8':
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
 
-# User-editable paths
-BASE_OUTPUT_DIR = Path(r"E:\Processing\ICESat-2\output_data")
-TIMESTAMP_FILE = BASE_OUTPUT_DIR / "latest_run_timestamp.txt"
-CROSSOVER_FILENAME = "icesat2_repeat_track_matches.csv"
-
-# ============================================================================
-# 1) CHECK PYTHON PACKAGES
-# ============================================================================
-
-print("\n[1/3] Checking required Python packages...\n")
-
-required_packages = [
-    "numpy",
-    "pandas",
-    "matplotlib",
-    "geopandas",
-    "scipy",
-    "shapely",
-]
-
-missing = []
-for pkg in required_packages:
-    try:
-        importlib.import_module(pkg)
-        print(f"  OK {pkg}")
-    except ImportError:
-        print(f"  MISSING {pkg}")
-        missing.append(pkg)
-
-if missing:
-    print("\nERROR: Missing packages:")
-    for pkg in missing:
-        print(f"  - {pkg}")
-    print("\nInstall with: pip install " + " ".join(missing))
-    sys.exit(1)
-
-print("\nOK All required packages available.\n")
+print("="*80)
+print("SCRIPT 00: SETUP & VALIDATION")
+print("="*80)
 
 # ============================================================================
-# 2) CHECK OUTPUT DIRECTORY & TIMESTAMP
+# IMPORT CONFIG
 # ============================================================================
-
-print("[2/3] Checking output directory and latest run timestamp...\n")
-
-if not BASE_OUTPUT_DIR.exists():
-    print(f"ERROR: Base output directory not found:")
-    print(f"  {BASE_OUTPUT_DIR}\n")
-    sys.exit(1)
-
-print(f"OK Base output dir: {BASE_OUTPUT_DIR}\n")
-
-if not TIMESTAMP_FILE.exists():
-    print(f"ERROR: latest_run_timestamp.txt not found in:")
-    print(f"  {BASE_OUTPUT_DIR}\n")
-    print("Run initial processing (Scripts 01-04) first.\n")
-    sys.exit(1)
 
 try:
-    with open(TIMESTAMP_FILE, "r") as f:
-        run_timestamp = f.read().strip()
-    OUTPUT_DIR = BASE_OUTPUT_DIR / f"run_{run_timestamp}"
-except Exception as e:
-    print(f"ERROR: Failed to read timestamp: {e}\n")
+    from config import BASEOUTPUTDIR, INPUTDIR, INSARDIR
+    print("\n✓ Configuration imported successfully")
+    print(f"  BASEOUTPUTDIR: {BASEOUTPUTDIR}")
+    print(f"  INPUTDIR: {INPUTDIR}")
+    print(f"  INSARDIR: {INSARDIR}")
+except ImportError as e:
+    print(f"\n✗ ERROR: Cannot import config.py")
+    print(f"  {e}")
     sys.exit(1)
-
-print(f"OK Latest run ID: {run_timestamp}")
-print(f"OK Run directory: {OUTPUT_DIR}\n")
-
-if not OUTPUT_DIR.exists():
-    print(f"ERROR: Run directory not found: {OUTPUT_DIR}\n")
-    sys.exit(1)
-
-print("OK Run directory exists.\n")
 
 # ============================================================================
-# 3) CHECK MAIN INPUT CSV
+# VALIDATE DIRECTORIES
 # ============================================================================
 
-print("[3/3] Checking main crossover CSV...\n")
+print("\n" + "="*80)
+print("VALIDATING DIRECTORIES")
+print("="*80)
 
-crossover_path = OUTPUT_DIR / CROSSOVER_FILENAME
+# Create base output directory if needed
+BASEOUTPUTDIR.mkdir(parents=True, exist_ok=True)
+print(f"✓ Base output directory: {BASEOUTPUTDIR}")
 
-if not crossover_path.exists():
-    print(f"ERROR: Crossover file not found:")
-    print(f"  {crossover_path}\n")
-    sys.exit(1)
+# Verify input directory exists
+if not INPUTDIR.exists():
+    print(f"⚠ WARNING: INPUTDIR does not exist: {INPUTDIR}")
+    print(f"  Scripts may fail if no input data available")
+else:
+    print(f"✓ Input directory: {INPUTDIR}")
+
+if not INSARDIR.exists():
+    print(f"⚠ WARNING: INSARDIR does not exist: {INSARDIR}")
+    print(f"  InSAR integration will be skipped")
+else:
+    print(f"✓ InSAR directory: {INSARDIR}")
+
+# ============================================================================
+# GENERATE AUTO-INCREMENT RUN ID (YYYYMMDD_nX FORMAT)
+# ============================================================================
+
+def get_next_run_id(base_dir):
+    """Generate daily auto-incrementing run ID (YYYYMMDD_n1, n2, etc.)
+    
+    Parameters
+    ----------
+    base_dir : Path
+        Base output directory
+    
+    Returns
+    -------
+    str
+        Run ID like '20260116_n1'
+    """
+    today = datetime.now().strftime('%Y%m%d')
+    base_dir = Path(base_dir)
+    
+    # Find existing run folders for today
+    existing_runs = list(base_dir.glob(f'run_{today}_n*'))
+    
+    if len(existing_runs) == 0:
+        run_number = 1
+    else:
+        # Extract numbers from folder names
+        numbers = []
+        for folder in existing_runs:
+            try:
+                num = int(folder.name.split('_n')[-1])
+                numbers.append(num)
+            except (ValueError, IndexError):
+                pass
+        run_number = max(numbers) + 1 if numbers else 1
+    
+    run_id = f'{today}_n{run_number}'
+    return run_id
+
+print("\n" + "="*80)
+print("GENERATING RUN ID")
+print("="*80)
+
+run_id = get_next_run_id(BASEOUTPUTDIR)
+print(f"\n✓ Generated run ID: {run_id}")
+
+# Create run output directory
+run_OUTPUTDIR = BASEOUTPUTDIR / f'run_{run_id}'
+run_OUTPUTDIR.mkdir(parents=True, exist_ok=True)
+print(f"✓ Created output directory: {run_OUTPUTDIR}")
+
+# ============================================================================
+# SAVE TIMESTAMP FILE FOR DOWNSTREAM SCRIPTS
+# ============================================================================
+
+timestamp_file = BASEOUTPUTDIR / 'latest_RUN_TIMESTAMP.txt'
 
 try:
-    import pandas as pd
-    df_head = pd.read_csv(crossover_path, nrows=5)
-    n_cols = len(df_head.columns)
+    with open(timestamp_file, 'w', encoding='utf-8') as f:
+        f.write(run_id)
+    print(f"✓ Saved timestamp file: {timestamp_file.name}")
+    print(f"  Content: {run_id}")
 except Exception as e:
-    print(f"ERROR: Could not read CSV: {e}\n")
+    print(f"\n✗ CRITICAL ERROR: Could not write timestamp file")
+    print(f"  {e}")
     sys.exit(1)
 
-print(f"OK Crossover CSV: {CROSSOVER_FILENAME}")
-print(f"OK Columns: {n_cols}\n")
-
 # ============================================================================
-# FINAL SUMMARY
+# VALIDATION SUMMARY
 # ============================================================================
 
-print("=" * 80)
-print("SCRIPT 00 - SUCCESS")
-print("=" * 80)
-print(f"Date/Time: {dt.datetime.now()}")
-print(f"Base dir : {BASE_OUTPUT_DIR}")
-print(f"Run ID   : run_{run_timestamp}")
-print(f"CSV file : {CROSSOVER_FILENAME}")
-print("=" * 80 + "\n")
+print("\n" + "="*80)
+print("VALIDATION COMPLETE")
+print("="*80)
 
-sys.exit(0)
+print(f"\n✓ All checks passed!")
+print(f"✓ Ready for next script (01_filter_photons.py)")
+print(f"✓ Run ID: {run_id}")
+print(f"✓ Output: {run_OUTPUTDIR}")
+
+print("\n" + "="*80 + "\n")

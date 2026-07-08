@@ -280,8 +280,7 @@ def filter_outliers_multitier(df, rate_col, config, logger=None):
     """
     Multi-tier outlier filtering (Phase 2A / Nature 2024 methodology).
 
-    Tier 1: Physical plausibility — removes |rate| > RATE_PHYSICAL_MAX_CM_YR
-            and |dH| > DH_PHYSICAL_MAX_M. ALWAYS applied.
+    Tier 1: Physical plausibility — removes |rate| > RATE_PHYSICAL_MAX_CM_YR and |dH| > DH_PHYSICAL_MAX_M. ALWAYS applied.
     Tier 2: Progressive sigma — applied per value in config.OUTLIER_SIGMA_TIERS to rate_col. If config.OUTLIER_SIGMA_TIERS is empty (user passed --outlier-filter off), Tier 2 is automatically skipped.
 
     NOTE: rate_col is expected in the SAME units as RATE_PHYSICAL_MAX_CM_YR. Both must be in cm/yr. Filtering is applied directly to 'subsidence_rate_cm_per_year' - no intermediate mm/yr column is created.
