@@ -56,6 +56,12 @@ Always run the full pipeline via this script for production runs. The
 execution log and state file are key artefacts for demonstrating that
 results were produced in a single, documented run and can be reproduced
 from the same code and inputs.
+
+How to run
+---------------------
+python 08_run_workflow.py --temporal 2
+python 08_run_workflow.py --temporal 3
+python 08_run_workflow.py --temporal 4
 """
 
 import subprocess

@@ -1,5 +1,7 @@
 """
-SCRIPT 01: ICeSat-2 PHOTON FILTERING - CORRECTED VERSION
+================================================================================
+SCRIPT 01: ICeSat-2 PHOTON FILTERING - CORRECTED VERSION (MSL)
+================================================================================
 
 Purpose
 -------
@@ -17,6 +19,7 @@ Key Improvements (This Version)
 ✓ Fixed: Generates year-by-year photon counts
 ✓ Fixed: UTF-8 encoding throughout
 ✓ NEW: Comprehensive filtering summary
+✓ NEW: Uses Height (m MSL) for ground filtering (was HAE)
 
 Inputs
 ------
@@ -45,12 +48,13 @@ if sys.stdout.encoding != 'utf-8':
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 if sys.stderr.encoding != 'utf-8':
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
-
+    
 warnings.filterwarnings('ignore')
 
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
+
 from config import INPUTDIR, BASEOUTPUTDIR
 
 # NATURE PAPER IMPROVEMENTS: Strong beams only
@@ -61,37 +65,37 @@ WEAK_BEAMS = ['gt1r', 'gt2r', 'gt3r']    # Discard these
 CONFIDENCE_THRESHOLD = 3  # 3=high, 4=highest (was 2=medium in old version)
 
 print("=" * 80, flush=True)
-print("SCRIPT 01: ICeSat-2 PHOTON FILTERING - STRONG BEAMS ONLY", flush=True)
+print("SCRIPT 01: ICeSat-2 PHOTON FILTERING - STRONG BEAMS ONLY (MSL)", flush=True)
 print("=" * 80, flush=True)
 print(f"Input directory: {INPUTDIR}", flush=True)
 print(f"Output directory: {BASEOUTPUTDIR}", flush=True)
 print(f"IMPROVEMENTS FROM NATURE PAPER:", flush=True)
-print(f" • Strong beams only: {STRONG_BEAMS}", flush=True)
-print(f" • Discard weak beams: {WEAK_BEAMS}", flush=True)
-print(f" • Confidence threshold: {CONFIDENCE_THRESHOLD} (higher quality)", flush=True)
+print(f"  • Strong beams only: {STRONG_BEAMS}", flush=True)
+print(f"  • Discard weak beams: {WEAK_BEAMS}", flush=True)
+print(f"  • Confidence threshold: {CONFIDENCE_THRESHOLD} (higher quality)", flush=True)
+print(f"  • Height datum: MSL (Mean Sea Level)", flush=True)
 print("=" * 80, flush=True)
 
 # ============================================================================
 # CRITICAL FIX: READ TIMESTAMP FROM SCRIPT 00
 # ============================================================================
-print("\nReading run timestamp from Script 00...", flush=True)
 
+print("\nReading run timestamp from Script 00...", flush=True)
 timestamp_file = Path(BASEOUTPUTDIR) / 'latest_RUN_TIMESTAMP.txt'
 
 if not timestamp_file.exists():
     print(f"\n✗ ERROR: Timestamp file not found: {timestamp_file}")
-    print(f"  Script 00 must run first!")
+    print(f"   Script 00 must run first!")
     sys.exit(1)
 
 with open(timestamp_file, 'r', encoding='utf-8') as f:
     RUN_TIMESTAMP = f.read().strip()
-
+    
 print(f"✓ Run ID: {RUN_TIMESTAMP}")
 
 # Create output folder (should already exist from Script 00)
 OUTPUT_DIR = Path(BASEOUTPUTDIR) / f'run_{RUN_TIMESTAMP}'
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
 print(f"✓ Output folder: {OUTPUT_DIR.name}")
 print("=" * 80)
 
@@ -106,7 +110,6 @@ def load_phoreal_csv(csv_path):
         # Extract metadata from filename
         filename = Path(csv_path).stem
         parts = filename.split('_')
-        
         df['filename'] = filename
         df['date'] = pd.to_datetime(parts[2][0:8], format='%Y%m%d')
         df['year'] = df['date'].dt.year
@@ -155,7 +158,7 @@ def load_phoreal_las(las_path):
             'Longitude (deg)': las.x,
             'UTM Easting (m)': las.X if hasattr(las, 'X') else np.full(len(las.x), np.nan),
             'UTM Northing (m)': las.Y if hasattr(las, 'Y') else np.full(len(las.x), np.nan),
-            'Height (m HAE)': las.z,
+            'Height (m MSL)': las.z,  # ✓ CORRECTED: MSL for LAS files
             'Classification': las.classification if hasattr(las, 'classification') else np.full(len(las.x), 1),
             'Signal Confidence': las.intensity if hasattr(las, 'intensity') else np.full(len(las.x), 4)
         })
@@ -163,7 +166,6 @@ def load_phoreal_las(las_path):
         # Extract metadata from filename
         filename = Path(las_path).stem
         parts = filename.split('_')
-        
         df['filename'] = filename
         df['date'] = pd.to_datetime(parts[2][0:8], format='%Y%m%d')
         df['year'] = df['date'].dt.year
@@ -202,16 +204,16 @@ def load_best_format(base_path):
     # Return whichever has more data
     if df_csv is not None and df_las is not None:
         if len(df_csv) >= len(df_las):
-            print(f" - Using CSV ({len(df_csv):,} photons)", flush=True)
+            print(f"   - Using CSV ({len(df_csv):,} photons)", flush=True)
             return df_csv
         else:
-            print(f" - Using LAS ({len(df_las):,} photons)", flush=True)
+            print(f"   - Using LAS ({len(df_las):,} photons)", flush=True)
             return df_las
     elif df_csv is not None:
-        print(f" - Using CSV ({len(df_csv):,} photons)", flush=True)
+        print(f"   - Using CSV ({len(df_csv):,} photons)", flush=True)
         return df_csv
     elif df_las is not None:
-        print(f" - Using LAS ({len(df_las):,} photons)", flush=True)
+        print(f"   - Using LAS ({len(df_las):,} photons)", flush=True)
         return df_las
     else:
         return None
@@ -223,6 +225,7 @@ def filter_ground_photons(df, confidence_threshold=3):
     """Filter for high-quality ground photons
     
     IMPROVED: Higher confidence threshold (3-4 only)
+    CORRECTED: Uses Height (m MSL) for ground filtering
     """
     df_filtered = df.copy()
     initial_count = len(df_filtered)
@@ -230,14 +233,14 @@ def filter_ground_photons(df, confidence_threshold=3):
     # Filter 1: Signal confidence (IMPROVED: threshold=3 instead of 2)
     if 'Signal Confidence' in df_filtered.columns:
         df_filtered = df_filtered[df_filtered['Signal Confidence'] >= confidence_threshold]
-        print(f" After confidence filter: {len(df_filtered):,} photons", flush=True)
+        print(f"   After confidence filter: {len(df_filtered):,} photons", flush=True)
     
     # Filter 2: Classification (ground points)
     if 'Classification' in df_filtered.columns and df_filtered['Classification'].notna().any():
         df_filtered = df_filtered[df_filtered['Classification'].isin([1, 4])]
-        print(f" After classification filter: {len(df_filtered):,} photons (used ATL08)", flush=True)
+        print(f"   After classification filter: {len(df_filtered):,} photons (used ATL08)", flush=True)
     else:
-        print(f" No ATL08 classification - using height-based filtering", flush=True)
+        print(f"   No ATL08 classification - using height-based filtering", flush=True)
         
         # Height-based filtering if no classification
         if 'Along-Track (m)' in df_filtered.columns:
@@ -246,27 +249,28 @@ def filter_ground_photons(df, confidence_threshold=3):
             def filter_ground_by_height(group):
                 if len(group) < 5:
                     return group
-                threshold = group['Height (m HAE)'].quantile(0.20)
-                return group[group['Height (m HAE)'] <= threshold]
+                # ✓ CORRECTED: Use Height (m MSL) instead of Height (m HAE)
+                threshold = group['Height (m MSL)'].quantile(0.20)
+                return group[group['Height (m MSL)'] <= threshold]
             
             df_filtered = df_filtered.groupby(
-                ['rgt', 'cycle', 'beam', 'segment'], 
+                ['rgt', 'cycle', 'beam', 'segment'],
                 observed=True
             ).apply(filter_ground_by_height).reset_index(drop=True)
             
             df_filtered = df_filtered.drop(columns='segment')
-            print(f" After height-based filter: {len(df_filtered):,} photons", flush=True)
+            print(f"   After height-based filter: {len(df_filtered):,} photons", flush=True)
     
-    print(f" Filtered: {initial_count:,} → {len(df_filtered):,} photons ({len(df_filtered)/initial_count*100:.1f}% retained)", flush=True)
+    print(f"   Filtered: {initial_count:,} → {len(df_filtered):,} photons ({len(df_filtered)/initial_count*100:.1f}% retained)", flush=True)
     
     return df_filtered
+
 
 # ============================================================================
 # MAIN PROCESSING
 # ============================================================================
 def main():
     print("\nSearching for ICeSat-2 files...", flush=True)
-    
     csv_files = sorted(glob.glob(str(Path(INPUTDIR) / 'processed*ATL03*.csv')))
     
     if len(csv_files) == 0:
@@ -304,7 +308,7 @@ def main():
             df = load_best_format(str(filepath))
             
             if df is None or len(df) == 0:
-                print(f" WARNING: Skipping - no data", flush=True)
+                print(f"   WARNING: Skipping - no data", flush=True)
                 continue
             
             # IMPROVED FILTERING
@@ -313,7 +317,7 @@ def main():
             if len(df_filtered) > 0:
                 all_data.append(df_filtered)
             else:
-                print(f" WARNING: No photons passed filtering", flush=True)
+                print(f"   WARNING: No photons passed filtering", flush=True)
     
     if len(all_data) == 0:
         print("\nERROR: No data survived filtering!", flush=True)
@@ -321,12 +325,12 @@ def main():
     
     print(f"\n{'='*80}", flush=True)
     print(f"Combining {len(all_data)} datasets...", flush=True)
-    
     icesat2_data = pd.concat(all_data, ignore_index=True)
     
     # ========================================================================
     # SUMMARY STATISTICS
     # ========================================================================
+    
     print("\n" + "=" * 80, flush=True)
     print("FILTERING SUMMARY", flush=True)
     print("=" * 80, flush=True)
@@ -335,14 +339,14 @@ def main():
     print(f"Years covered: {sorted(icesat2_data['year'].unique())}", flush=True)
     print(f"Unique RGTs: {icesat2_data['rgt'].nunique()}", flush=True)
     print(f"Unique beams: {sorted(icesat2_data['beam'].unique())}", flush=True)
-    
     print(f"\nBEAM DISTRIBUTION (Strong beams only):", flush=True)
-    print(f" Strong beam photons: {len(icesat2_data[icesat2_data['beam_strength']=='strong']):,} (100%)", flush=True)
-    print(f" Weak beam photons: {len(icesat2_data[icesat2_data['beam_strength']=='weak']):,} (0% - filtered out)", flush=True)
+    print(f"  Strong beam photons: {len(icesat2_data[icesat2_data['beam_strength']=='strong']):,} (100%)", flush=True)
+    print(f"  Weak beam photons: {len(icesat2_data[icesat2_data['beam_strength']=='weak']):,} (0% - filtered out)", flush=True)
     
     # ========================================================================
     # YEAR-BY-YEAR PHOTON COUNT [NEW]
     # ========================================================================
+    
     print("\n" + "=" * 80, flush=True)
     print("PHOTON COUNTS BY YEAR", flush=True)
     print("=" * 80 + "\n", flush=True)
@@ -364,20 +368,19 @@ def main():
     # ========================================================================
     # SAVE RESULTS
     # ========================================================================
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     output_file = OUTPUT_DIR / 'icesat2_filtered_ground_photons.csv'
     
     print(f"\nSaving to: {output_file}", flush=True)
-    
     icesat2_data.to_csv(output_file, index=False, encoding='utf-8')
-    
     print(f"[OK] Saved successfully ({output_file.stat().st_size / (1024*1024):.1f} MB)", flush=True)
     
     # ========================================================================
     # SAVE YEAR-BY-YEAR COUNTS TO TXT FILE [NEW]
     # ========================================================================
-    count_file =  OUTPUT_DIR / '01_photon_counts_by_year.txt'
+    
+    count_file = OUTPUT_DIR / '01_photon_counts_by_year.txt'
     
     with open(count_file, 'w', encoding='utf-8') as f:
         f.write("=" * 80 + "\n")
@@ -402,18 +405,20 @@ def main():
     # ========================================================================
     # SAVE SUMMARY
     # ========================================================================
+    
     summary_file = OUTPUT_DIR / 'filtering_summary.txt'
     
     with open(summary_file, 'w', encoding='utf-8') as f:
         f.write("=" * 80 + "\n")
-        f.write("ICeSat-2 Photon Filtering Summary - NATURE PAPER METHOD\n")
+        f.write("ICeSat-2 Photon Filtering Summary - NATURE PAPER METHOD (MSL)\n")
         f.write("=" * 80 + "\n\n")
         f.write(f"Processing date: {datetime.now()}\n")
         f.write(f"Run ID: {RUN_TIMESTAMP}\n\n")
         f.write("IMPROVEMENTS FROM NATURE PAPER:\n")
-        f.write(f" • Strong beams only: {STRONG_BEAMS}\n")
-        f.write(f" • Discarded weak beams: {WEAK_BEAMS}\n")
-        f.write(f" • Confidence threshold: {CONFIDENCE_THRESHOLD} (3=high, 4=highest)\n\n")
+        f.write(f"  • Strong beams only: {STRONG_BEAMS}\n")
+        f.write(f"  • Discarded weak beams: {WEAK_BEAMS}\n")
+        f.write(f"  • Confidence threshold: {CONFIDENCE_THRESHOLD} (3=high, 4=highest)\n")
+        f.write(f"  • Height datum: MSL (Mean Sea Level)\n\n")
         f.write(f"Total photons: {len(icesat2_data):,}\n")
         f.write(f"Date range: {icesat2_data['date'].min()} to {icesat2_data['date'].max()}\n")
         f.write(f"Years: {sorted(icesat2_data['year'].unique())}\n")
@@ -427,6 +432,7 @@ def main():
     print("SCRIPT 01 COMPLETE", flush=True)
     print("=" * 80, flush=True)
     print(f"\nNext step: Run Script 02 (Terrain Classification)\n", flush=True)
+
 
 if __name__ == '__main__':
     main()

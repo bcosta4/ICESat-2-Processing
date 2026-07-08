@@ -291,8 +291,8 @@ print("=" * 80)
 
 # FIX: Compute x_utm/y_utm if missing
 if ('x_utm' not in df_pairs.columns) or ('y_utm' not in df_pairs.columns):
-    lon_col = next((c for c in df_pairs.columns if 'lon_avg' in c or 'longitude' in c.lower()), None)
-    lat_col = next((c for c in df_pairs.columns if 'lat_avg' in c or 'latitude' in c.lower()), None)
+    lon_col = next((c for c in df_pairs.columns if any(x in c.lower() for x in ['lon_avg', 'lonavg', 'longitude'])), None)
+    lat_col = next((c for c in df_pairs.columns if any(x in c.lower() for x in ['lat_avg', 'latavg', 'latitude'])), None)
     
     if lon_col and lat_col:
         try:
