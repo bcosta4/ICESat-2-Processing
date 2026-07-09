@@ -52,14 +52,14 @@ if sys.stderr.encoding != 'utf-8':
 
 warnings.filterwarnings('ignore')
 
-from config import INPUT_DIR, BASE_OUTPUT_DIR, VALID_PRODUCTS, DEFAULT_PRODUCT, PRODUCT_FILE_PATTERNS
+from config import INPUTDIR, BASEOUTPUTDIR, VALIDPRODUCTS, DEFAULTPRODUCT, PRODUCTFILEPATTERNS
 
 # =============================================================================
 # ARGUMENTS
 # =============================================================================
 parser = argparse.ArgumentParser(description='ICESat-2 Multi-Product Filtering')
-parser.add_argument('--product', type=str, choices=VALID_PRODUCTS, default=DEFAULT_PRODUCT,
-                     help=f'ICESat-2 product to process. Choices: {VALID_PRODUCTS}')
+parser.add_argument('--product', type=str, choices=VALIDPRODUCTS, default=DEFAULTPRODUCT,
+                     help=f'ICESat-2 product to process. Choices: {VALIDPRODUCTS}')
 args = parser.parse_args()
 PRODUCT = args.product
 
@@ -134,8 +134,8 @@ print("=" * 80, flush=True)
 print("SCRIPT 01: ICESat-2 DATA FILTERING - MULTI-PRODUCT", flush=True)
 print("=" * 80, flush=True)
 print(f"Product selected: {PRODUCT}", flush=True)
-print(f"Input directory: {INPUT_DIR}", flush=True)
-print(f"Output directory: {BASE_OUTPUT_DIR}", flush=True)
+print(f"Input directory: {INPUTDIR}", flush=True)
+print(f"Output directory: {BASEOUTPUTDIR}", flush=True)
 if PRODUCT in ('ATL03', 'ATL08'):
     print(f" - Strong beams only: {STRONG_BEAMS}", flush=True)
     print(f" - Confidence threshold: {CONFIDENCE_THRESHOLD}", flush=True)
@@ -147,7 +147,7 @@ _study_area_union, _study_area_desc = load_study_area_polygon()
 print(f" - Study-area filter: polygon-based ({STUDY_AREA_GPKG.name})", flush=True)
 print("=" * 80, flush=True)
 
-timestamp_file = Path(BASE_OUTPUT_DIR) / 'latest_RUN_TIMESTAMP.txt'
+timestamp_file = Path(BASEOUTPUTDIR) / 'latest_RUN_TIMESTAMP.txt'
 if not timestamp_file.exists():
     print(f" Timestamp file not found: {timestamp_file}")
     print("Script 00 must run first!")
@@ -155,7 +155,7 @@ if not timestamp_file.exists():
 with open(timestamp_file, 'r', encoding='utf-8') as f:
     RUN_TIMESTAMP = f.read().strip()
 
-OUTPUT_DIR = Path(BASE_OUTPUT_DIR) / f"run_{RUN_TIMESTAMP}"
+OUTPUT_DIR = Path(BASEOUTPUTDIR) / f"run_{RUN_TIMESTAMP}"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 print(f"Run ID: {RUN_TIMESTAMP}")
 print(f"Output folder: {OUTPUT_DIR.name}")
@@ -546,12 +546,12 @@ def main():
     print(f" for ICESat-2 {PRODUCT} files...", flush=True)
 
     if PRODUCT == 'ATL06':
-        h5_files = sorted(glob.glob(str(Path(INPUT_DIR) / '*ATL06*.h5')))
-        csv_files_atl06 = sorted(glob.glob(str(Path(INPUT_DIR) / '*ATL06*.csv')))
+        h5_files = sorted(glob.glob(str(Path(INPUTDIR) / '*ATL06*.h5')))
+        csv_files_atl06 = sorted(glob.glob(str(Path(INPUTDIR) / '*ATL06*.csv')))
 
         if len(h5_files) == 0 and len(csv_files_atl06) == 0:
             print("ERROR: No ATL06 .h5 or .csv files found!", flush=True)
-            print(f"Check path: {INPUT_DIR}", flush=True)
+            print(f"Check path: {INPUTDIR}", flush=True)
             return
 
         if len(h5_files) > 0:
@@ -590,11 +590,11 @@ def main():
 
     else:
         # ATL03 / ATL08 - PhoREAL CSV/LAS
-        pattern = PRODUCT_FILE_PATTERNS[PRODUCT]
-        csv_files = sorted(glob.glob(str(Path(INPUT_DIR) / pattern)))
+        pattern = PRODUCTFILEPATTERNS[PRODUCT]
+        csv_files = sorted(glob.glob(str(Path(INPUTDIR) / pattern)))
         if len(csv_files) == 0:
             print(f"ERROR: No {PRODUCT} files found!", flush=True)
-            print(f"Check path: {INPUT_DIR}", flush=True)
+            print(f"Check path: {INPUTDIR}", flush=True)
             return
 
         print(f"Found {len(csv_files)} CSV files", flush=True)
@@ -608,7 +608,7 @@ def main():
         for base_filename in unique_files:
             for beam in STRONG_BEAMS:
                 file_count += 1
-                filepath = Path(INPUT_DIR) / f"{base_filename}_{beam}.csv"
+                filepath = Path(INPUTDIR) / f"{base_filename}_{beam}.csv"
                 if not filepath.exists():
                     continue
                 print(f"[{file_count}/{len(unique_files)}] Processing {filepath.name}", flush=True)

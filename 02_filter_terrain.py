@@ -59,7 +59,7 @@ import pandas as pd
 import geopandas as gpd
 from shapely.geometry import Point
 
-from config import BASEOUTPUTDIR, VALID_PRODUCTS, DEFAULT_PRODUCT
+from config import BASEOUTPUTDIR, VALIDPRODUCTS, DEFAULTPRODUCT
 
 # UTF-8 encoding for Windows
 if sys.stdout.encoding != 'utf-8':
@@ -72,7 +72,7 @@ if sys.stderr.encoding != 'utf-8':
 # ============================================================================
 parser = argparse.ArgumentParser(description="ICESat-2 Terrain Classification")
 parser.add_argument(
-    '--product', type=str, choices=VALID_PRODUCTS, default=DEFAULT_PRODUCT,
+    '--product', type=str, choices=VALIDPRODUCTS, default=DEFAULTPRODUCT,
     help='ICESat-2 product being processed (for logging/metadata only; '
          'terrain classification logic is identical across products)'
 )

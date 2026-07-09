@@ -32,11 +32,11 @@ CANVEC_WATERBODY_SHAPEFILE = Path(
 # ============================================================================
 # Valid ICESat-2 products supported by the workflow.
 # Passed via --product on 08_run_workflow.py, propagated to Scripts 01-03.
-VALID_PRODUCTS = ['ATL03', 'ATL06', 'ATL08']
-DEFAULT_PRODUCT = 'ATL08'  # matches legacy hardcoded behaviour
+VALIDPRODUCTS = ['ATL03', 'ATL06', 'ATL08']
+DEFAULTPRODUCT = 'ATL08'  # matches legacy hardcoded behaviour
 
 # File-glob patterns used by Script 01 when searching INPUTDIR
-PRODUCT_FILE_PATTERNS = {
+PRODUCTFILEPATTERNS = {
     'ATL03': 'processed*ATL03*.csv',   # PhoREAL-exported photon CSV/LAS
     'ATL08': 'processed*ATL08*.csv',   # PhoREAL-exported land/veg segment CSV/LAS
     'ATL06': '*ATL06*.h5',             # Standard NASA ATL06 HDF5 granules
@@ -130,8 +130,8 @@ if __name__ == '__main__':
     print(f"INPUTDIR                   : {INPUTDIR}")
     print(f"INSARDIR                   : {INSARDIR}")
     print(f"CANVEC_WATERBODY_SHAPEFILE : {CANVEC_WATERBODY_SHAPEFILE}")
-    print(f"VALID_PRODUCTS              : {VALID_PRODUCTS}")
-    print(f"DEFAULT_PRODUCT             : {DEFAULT_PRODUCT}")
+    print(f"VALIDPRODUCTS              : {VALIDPRODUCTS}")
+    print(f"DEFAULTPRODUCT             : {DEFAULTPRODUCT}")
     print(f"DEFAULT_OUTLIER_FILTER      : {DEFAULT_OUTLIER_FILTER_ENABLED}")
     print(f"DEFAULT_OUTLIER_SIGMA_TIERS : {DEFAULT_OUTLIER_SIGMA_TIERS}")
     print()
